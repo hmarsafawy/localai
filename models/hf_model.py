@@ -84,3 +84,46 @@ class HfPipelineInfo(BaseModel):
     components: list[HfPipelineComponent] = Field(default_factory=list)
     missing_components: list[str] = Field(default_factory=list)
     extra_config: dict[str, Any] = Field(default_factory=dict)
+
+
+class HfSuggestedSource(BaseModel):
+    """A repo (and, when known, specific files) where a missing role can be sourced from."""
+
+    model_config = ConfigDict(extra="allow")
+
+    repo_id: str
+    files: list[str] = Field(default_factory=list)
+    note: str | None = None
+
+
+class HfRequirementRole(BaseModel):
+    """One thing a pipeline needs (a text encoder, a VAE, ...), regardless of
+    whether the repo itself has a `model_index.json`."""
+
+    model_config = ConfigDict(extra="allow")
+
+    role: str
+    architecture: str | None = None
+    required: bool = True
+    present: bool = False
+    source: str = "repo"  # "repo" | "base_model" | "fingerprint" | "registry"
+    confidence: str = "high"  # "high" | "low"
+    subfolder: str | None = None
+    files: list[str] = Field(default_factory=list)
+    sources: list[HfSuggestedSource] = Field(default_factory=list)
+
+
+class HfModelRequirements(BaseModel):
+    """What a model needs to run, resolved without requiring a `model_index.json`:
+    falls back through the repo's `base_model` ancestry, weight tensor-name
+    fingerprinting, and a small curated table of known pipeline families."""
+
+    model_config = ConfigDict(extra="allow")
+
+    model_id: str
+    family: str | None = None
+    pipeline_class: str | None = None
+    resolved_from: str | None = None
+    roles: list[HfRequirementRole] = Field(default_factory=list)
+    unidentified_files: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)

@@ -2,17 +2,34 @@ from fastapi import APIRouter, HTTPException, Query
 from anyio import to_thread
 from huggingface_hub.utils import HfHubHTTPError
 
-from models.hf_model import HfModel, HfPipelineInfo
+from models.hf_model import HfModel, HfModelRequirements, HfPipelineInfo
 from schemas.hf_model import (
     HfModelResponse,
     HfModelSearchRequest,
     HfModelSearchResponse,
     HfPipelineResponse,
+    HfRequirementsResponse,
 )
 from services.huggingface import HuggingFaceService, ModelIndexNotFoundError
 
 router = APIRouter()
 service = HuggingFaceService()
+
+
+def _map_hf_error(error: HfHubHTTPError) -> HTTPException:
+    """`HfHubHTTPError` covers everything from a real 404 to a gated repo to a
+    rate limit - collapsing all of that into a blanket "not found" is
+    misleading, so surface what the Hub actually said instead."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    if status == 404:
+        return HTTPException(status_code=404, detail="Hugging Face model not found")
+    if status in (401, 403):
+        return HTTPException(
+            status_code=403, detail="This repository is gated or private and could not be accessed"
+        )
+    if status == 429:
+        return HTTPException(status_code=429, detail="Rate limited by the Hugging Face Hub, try again shortly")
+    return HTTPException(status_code=502, detail=f"Hugging Face Hub error ({status or 'unknown'}): {error}")
 
 
 @router.get("/", response_model=HfModelSearchResponse)
@@ -23,6 +40,23 @@ async def search_models(filters: HfModelSearchRequest = Query()) -> HfModelSearc
         limit=filters.limit,
         has_more=len(items) > filters.limit,
     )
+
+
+@router.get("/{model_id:path}/requirements", response_model=HfRequirementsResponse)
+async def get_model_requirements(
+    model_id: str,
+    resolve_base_model: bool = Query(default=True),
+    fingerprint: bool = Query(default=True),
+) -> HfModelRequirements:
+    """What a model needs to run, even without a `model_index.json`: falls back
+    through the repo's `base_model` ancestry, weight tensor-name fingerprinting,
+    and a small curated table of known pipeline families (Flux, SDXL, ...)."""
+    try:
+        return await to_thread.run_sync(
+            service.get_model_requirements, model_id, resolve_base_model, fingerprint
+        )
+    except HfHubHTTPError as error:
+        raise _map_hf_error(error) from error
 
 
 @router.get("/{model_id:path}/pipeline", response_model=HfPipelineResponse)
@@ -37,7 +71,7 @@ async def get_model_pipeline(model_id: str, include_config: bool = Query(default
             detail="Repository does not have a model_index.json (not a diffusers pipeline)",
         ) from error
     except HfHubHTTPError as error:
-        raise HTTPException(status_code=404, detail="Hugging Face model not found") from error
+        raise _map_hf_error(error) from error
 
 
 @router.get("/{model_id:path}", response_model=HfModelResponse)
@@ -45,4 +79,4 @@ async def get_model(model_id: str) -> HfModel:
     try:
         return await to_thread.run_sync(service.get_model, model_id)
     except HfHubHTTPError as error:
-        raise HTTPException(status_code=404, detail="Hugging Face model not found") from error
+        raise _map_hf_error(error) from error
