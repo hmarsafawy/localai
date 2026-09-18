@@ -21,6 +21,14 @@ class RegistryRole:
     filename_aliases: tuple[str, ...]
     companion_repo: str | None = None
     companion_files: tuple[str, ...] = ()
+    # A stricter subset of `filename_aliases` safe to use for *discovering* the
+    # family itself from a single bare filename with no other context. Generic
+    # role words ("vae", "unet", "transformer", "clip", "t5", ...) are used by
+    # virtually every architecture and must NEVER appear here - only tokens
+    # that are themselves brand-specific (e.g. "flux1-dev", "clip_l", "t5xxl")
+    # belong. Defaults to empty: a role that has no distinctive filename simply
+    # can't be used to discover its family, which is the safe default.
+    discovery_aliases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -49,6 +57,7 @@ FAMILIES: tuple[FamilyDef, ...] = (
                 "FluxTransformer2DModel",
                 True,
                 ("flux1-dev", "flux1-schnell", "transformer"),
+                discovery_aliases=("flux1-dev", "flux1-schnell"),
             ),
             RegistryRole(
                 "text_encoder",
@@ -57,6 +66,7 @@ FAMILIES: tuple[FamilyDef, ...] = (
                 ("clip_l", "clip-l", "clip_vit_l"),
                 "comfyanonymous/flux_text_encoders",
                 ("clip_l.safetensors",),
+                discovery_aliases=("clip_l", "clip-l", "clip_vit_l"),
             ),
             RegistryRole(
                 "text_encoder_2",
@@ -65,6 +75,7 @@ FAMILIES: tuple[FamilyDef, ...] = (
                 ("t5xxl", "t5-xxl", "t5_xxl"),
                 "comfyanonymous/flux_text_encoders",
                 ("t5xxl_fp16.safetensors", "t5xxl_fp8_e4m3fn.safetensors"),
+                discovery_aliases=("t5xxl", "t5-xxl", "t5_xxl"),
             ),
             RegistryRole(
                 "vae",
@@ -73,6 +84,7 @@ FAMILIES: tuple[FamilyDef, ...] = (
                 ("ae.safetensors", "vae"),
                 "black-forest-labs/FLUX.1-dev",
                 ("ae.safetensors",),
+                discovery_aliases=("ae.safetensors",),
             ),
         ),
     ),
@@ -94,10 +106,15 @@ FAMILIES: tuple[FamilyDef, ...] = (
                 ("vae", "sdxl_vae"),
                 "madebyollin/sdxl-vae-fp16-fix",
                 ("diffusion_pytorch_model.safetensors",),
+                discovery_aliases=("sdxl_vae",),
             ),
             RegistryRole("text_encoder", "CLIPTextModel", True, ("clip_l", "clip-l", "text_encoder")),
             RegistryRole(
-                "text_encoder_2", "CLIPTextModelWithProjection", True, ("clip_g", "clip-g", "text_encoder_2")
+                "text_encoder_2",
+                "CLIPTextModelWithProjection",
+                True,
+                ("clip_g", "clip-g", "text_encoder_2"),
+                discovery_aliases=("clip_g", "clip-g"),
             ),
         ),
     ),
@@ -110,7 +127,9 @@ FAMILIES: tuple[FamilyDef, ...] = (
         ),
         keywords=("stable-diffusion-3", "sd3"),
         roles=(
-            RegistryRole("transformer", "SD3Transformer2DModel", True, ("sd3", "transformer")),
+            RegistryRole(
+                "transformer", "SD3Transformer2DModel", True, ("sd3", "transformer"), discovery_aliases=("sd3",)
+            ),
             RegistryRole("vae", "AutoencoderKL", True, ("vae",)),
             RegistryRole("text_encoder", "CLIPTextModel", True, ("clip_l", "clip-l")),
             RegistryRole("text_encoder_2", "CLIPTextModelWithProjection", True, ("clip_g", "clip-g")),
@@ -145,8 +164,10 @@ FAMILIES: tuple[FamilyDef, ...] = (
         keywords=("wan2.1", "wan2.2", "wan-video"),
         roles=(
             RegistryRole("transformer", None, True, ("transformer",)),
-            RegistryRole("vae", None, True, ("vae", "wan_vae")),
-            RegistryRole("text_encoder", "UMT5EncoderModel", True, ("umt5", "t5")),
+            RegistryRole("vae", None, True, ("vae", "wan_vae"), discovery_aliases=("wan_vae",)),
+            RegistryRole(
+                "text_encoder", "UMT5EncoderModel", True, ("umt5", "t5"), discovery_aliases=("umt5",)
+            ),
         ),
     ),
     FamilyDef(
@@ -184,14 +205,17 @@ def match_family_by_keywords(*texts: str | None) -> FamilyDef | None:
 def match_filename_alias(filename: str) -> tuple[FamilyDef, RegistryRole] | None:
     """Global search across every family - only meant for discovering the family
     itself from a bare file with no other signal at all (e.g. a companion repo
-    with no base_model tag, no config.json). Once a family is already known,
-    use `match_filename_alias_in_family` instead so an alias belonging to a
-    different family can't hijack a role (aliases are not required to be
-    globally unique, only unique enough within their own family)."""
+    with no base_model tag, no config.json). Deliberately checks only each
+    role's `discovery_aliases`, not the full `filename_aliases`: a generic word
+    like "vae" or "unet" is used by nearly every architecture, so matching on
+    it globally would misattribute any unrecognized model's VAE to whichever
+    family happens to be listed first. Once a family is already known, use
+    `match_filename_alias_in_family` instead, which can safely use the fuller,
+    more generic alias list since it's no longer guessing the family too."""
     stem = filename.lower()
     for family in FAMILIES:
         for role in family.roles:
-            if any(alias in stem for alias in role.filename_aliases):
+            if any(alias in stem for alias in role.discovery_aliases):
                 return family, role
     return None
 
