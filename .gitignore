@@ -144,6 +144,8 @@ mnesia/
 rabbitmq/
 rabbitmq-data/
 
+settings.json
+
 # ActiveMQ
 activemq-data/
 

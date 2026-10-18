@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, TypeVar
 
 from dotenv import load_dotenv
 from huggingface_hub import HfApi, hf_hub_download
@@ -26,7 +27,14 @@ from services.pipeline_registry import (
     match_filename_alias,
     match_filename_alias_in_family,
 )
-from services.tensor_signatures import identify_by_tensor_names
+from services.tensor_signatures import (
+    HIGH_CONFIDENCE_COVERAGE,
+    ReferenceMatch,
+    identify_by_tensor_names,
+    is_lora,
+    match_reference,
+)
+from services.weight_headers import TensorShapes, read_tensor_shapes
 
 MODEL_INDEX_FILENAME = "model_index.json"
 
@@ -43,11 +51,9 @@ WEIGHT_FORMATS_BY_EXTENSION = {
     ".gguf": "gguf",
 }
 
-# Tensor-name fingerprinting reads a remote file's safetensors header (a range
-# request, not a full download) - only that format exposes tensor names this
-# cheaply, so it's the only one sniffed. GGUF has an equivalent header but
-# parsing it is deliberately out of scope for now.
-FINGERPRINT_EXTENSIONS = (".safetensors",)
+# Tensor-name fingerprinting reads a remote file's header (a range request, not
+# a full download) - only these formats expose tensor names that cheaply.
+FINGERPRINT_EXTENSIONS = (".safetensors", ".gguf")
 
 COMPONENT_CONFIG_FILENAMES = (
     "config.json",
@@ -62,6 +68,13 @@ BASE_MODEL_RELATION_PREFIXES = ("quantized:", "finetune:", "adapter:", "merge:")
 
 MAX_BASE_MODEL_CHAIN_DEPTH = 3
 MAX_FINGERPRINT_FILES = 6
+# Repos like ComfyUI/GGUF bundles ship a dozen quantizations of one component;
+# headers are tiny, so reading all of them is cheap, but keep a ceiling.
+MAX_REPO_MATCH_FILES = 32
+MAX_HEADER_READ_WORKERS = 8
+
+_Item = TypeVar("_Item")
+_Result = TypeVar("_Result")
 
 load_dotenv()
 
@@ -254,7 +267,7 @@ class HuggingFaceService:
 
         if resolved_pipeline is not None:
             return self._requirements_from_ancestor_pipeline(
-                model_id, resolved_pipeline, resolved_from, target_filenames, info, notes
+                model_id, resolved_pipeline, resolved_from, target_filenames, info, fingerprint, notes
             )
 
         return self._requirements_from_fingerprint(
@@ -427,6 +440,7 @@ class HuggingFaceService:
         resolved_from: str,
         target_filenames: list[str],
         info: Any,
+        fingerprint: bool,
         notes: list[str],
     ) -> HfModelRequirements:
         family = match_family_by_class(pipeline.class_name) or match_family_by_keywords(
@@ -434,22 +448,74 @@ class HuggingFaceService:
         )
         roles: list[HfRequirementRole] = []
 
+        # Full repo paths claimed per component by folder name or filename alias.
+        own_files_by_component: dict[str, list[str]] = {}
         for component in pipeline.components:
-            own_files = self._filenames_with_prefix(target_filenames, f"{component.name}/")
+            prefix = f"{component.name}/"
+            own_files = [name for name in target_filenames if name.startswith(prefix)]
             if not own_files:
                 own_files = self._filenames_by_alias(target_filenames, family, component.name)
+            own_files_by_component[component.name] = own_files
+        claimed = {name for files in own_files_by_component.values() for name in files}
 
-            if own_files:
+        # Anything left over that the name-based passes couldn't place (e.g.
+        # `text_encoders/qwen3vl_8b_bf16.safetensors`, a root-level GGUF of the
+        # transformer) is compared by tensor names against the base model's own
+        # components, so the repo's copies win before the base model is suggested.
+        matched: dict[str, list[tuple[str, ReferenceMatch]]] = {}
+        lora_files: list[str] = []
+        unidentified: list[str] = []
+        if fingerprint:
+            candidates = [
+                name
+                for name in target_filenames
+                if name not in claimed and self._extension(name) in FINGERPRINT_EXTENSIONS
+            ]
+            if candidates:
+                matched, lora_files, unidentified = self._match_files_to_components(
+                    model_id, pipeline, resolved_from, candidates, notes
+                )
+
+        for component in pipeline.components:
+            own_files = own_files_by_component[component.name]
+            fingerprinted = matched.get(component.name, [])
+
+            if own_files or fingerprinted:
+                prefix = f"{component.name}/"
+                only_subfolder = not fingerprinted and all(name.startswith(prefix) for name in own_files)
+                files = own_files + [filename for filename, _ in fingerprinted]
+                confidence = "high"
+                if not own_files and all(match.confidence == "low" for _, match in fingerprinted):
+                    confidence = "low"
                 roles.append(
                     HfRequirementRole(
                         role=component.name,
                         architecture=component.class_name,
                         required=component.required,
                         present=True,
-                        source="repo",
-                        files=own_files,
+                        source="repo" if own_files else "fingerprint",
+                        confidence=confidence,
+                        subfolder=component.name if only_subfolder else None,
+                        files=[name[len(prefix) :] for name in files] if only_subfolder else files,
                     )
                 )
+                full_copies = [
+                    filename
+                    for filename, match in fingerprinted
+                    if match.reference_coverage >= HIGH_CONFIDENCE_COVERAGE
+                ]
+                if len(full_copies) > 1:
+                    notes.append(
+                        f"{component.name}: {len(full_copies)} files each hold the complete component "
+                        "(different precisions/quantizations) - only one of them is needed"
+                    )
+                for filename, match in fingerprinted:
+                    if match.confidence == "low":
+                        notes.append(
+                            f"{filename} only partially matches {resolved_from}'s {component.name} "
+                            f"(by {match.method}, {match.reference_coverage:.0%} of its tensors) - "
+                            "likely a restructured/converted copy that needs a matching loader"
+                        )
                 continue
 
             sources: list[HfSuggestedSource] = []
@@ -475,14 +541,132 @@ class HuggingFaceService:
                 )
             )
 
+        if lora_files:
+            roles.append(
+                HfRequirementRole(
+                    role="lora",
+                    architecture=None,
+                    required=False,
+                    present=True,
+                    source="fingerprint",
+                    files=lora_files,
+                )
+            )
+
         return HfModelRequirements(
             model_id=model_id,
             family=family.name if family else None,
             pipeline_class=pipeline.class_name,
             resolved_from=resolved_from,
             roles=roles,
+            unidentified_files=unidentified,
             notes=notes,
         )
+
+    def _match_files_to_components(
+        self,
+        model_id: str,
+        pipeline: HfPipelineInfo,
+        reference_repo: str,
+        candidates: list[str],
+        notes: list[str],
+    ) -> tuple[dict[str, list[tuple[str, ReferenceMatch]]], list[str], list[str]]:
+        """Attribute each candidate weight file in `model_id` to whichever of the
+        reference pipeline's components it matches best by tensor names/shapes.
+        Returns (component name -> [(file, match)], LoRA files, unmatched files)."""
+        references = self._component_references(reference_repo, pipeline, notes)
+        if not references:
+            return {}, [], list(candidates)
+
+        to_read = candidates[:MAX_REPO_MATCH_FILES]
+        unidentified = list(candidates[MAX_REPO_MATCH_FILES:])
+        if unidentified:
+            notes.append(
+                f"only the first {MAX_REPO_MATCH_FILES} weight files were fingerprinted; "
+                f"{len(unidentified)} were skipped"
+            )
+
+        headers = self._read_headers(model_id, to_read, notes)
+        matched: dict[str, list[tuple[str, ReferenceMatch]]] = {}
+        lora_files: list[str] = []
+        for filename in to_read:
+            shapes = headers.get(filename)
+            if not shapes:
+                unidentified.append(filename)
+                continue
+            if is_lora(list(shapes)):
+                lora_files.append(filename)
+                continue
+
+            best: tuple[str, ReferenceMatch] | None = None
+            for component_name, (reference_keys, reference_shapes) in references.items():
+                match = match_reference(shapes, reference_keys, reference_shapes)
+                if match is not None and (best is None or match.score > best[1].score):
+                    best = (component_name, match)
+            if best is None:
+                unidentified.append(filename)
+                continue
+            matched.setdefault(best[0], []).append((filename, best[1]))
+
+        return matched, lora_files, unidentified
+
+    def _component_references(
+        self, repo_id: str, pipeline: HfPipelineInfo, notes: list[str]
+    ) -> dict[str, tuple[list[str], TensorShapes | None]]:
+        """Tensor names (and shapes, when cheaply available) of each weight-bearing
+        component in a diffusers repo. A sharded component's `*.index.json`
+        already lists every tensor name in one small download, so that's
+        preferred over reading each shard's header (at the cost of shapes)."""
+
+        def load(component: HfPipelineComponent) -> tuple[list[str], TensorShapes | None] | None:
+            names = [pipeline_file.filename for pipeline_file in component.files]
+            index_name = next((name for name in names if name.endswith(".safetensors.index.json")), None)
+            try:
+                if index_name is not None:
+                    index_path = hf_hub_download(
+                        repo_id=repo_id, filename=f"{component.subfolder}/{index_name}", token=self.token
+                    )
+                    with open(index_path, encoding="utf-8") as file:
+                        return list(json.load(file).get("weight_map", {})), None
+                shapes: TensorShapes = {}
+                for name in names:
+                    if self._extension(name) == ".safetensors":
+                        shapes.update(
+                            read_tensor_shapes(self.api, self.token, repo_id, f"{component.subfolder}/{name}")
+                        )
+                return (list(shapes), shapes) if shapes else None
+            except (HfHubHTTPError, OSError, ValueError) as error:
+                notes.append(f"could not read {repo_id}'s {component.name} tensor list ({error})")
+                return None
+
+        components = [component for component in pipeline.components if component.files]
+        loaded = self._run_parallel(load, components)
+        return {
+            component.name: reference
+            for component, reference in zip(components, loaded)
+            if reference is not None
+        }
+
+    def _read_headers(self, repo_id: str, filenames: list[str], notes: list[str]) -> dict[str, TensorShapes]:
+        def read(filename: str) -> TensorShapes | None:
+            try:
+                return read_tensor_shapes(self.api, self.token, repo_id, filename)
+            except (HfHubHTTPError, OSError, ValueError) as error:
+                notes.append(f"could not read tensor metadata for {filename} ({error})")
+                return None
+
+        return {
+            filename: shapes
+            for filename, shapes in zip(filenames, self._run_parallel(read, filenames))
+            if shapes is not None
+        }
+
+    @staticmethod
+    def _run_parallel(function: Callable[[_Item], _Result], items: list[_Item]) -> list[_Result]:
+        if len(items) <= 1:
+            return [function(item) for item in items]
+        with ThreadPoolExecutor(max_workers=min(MAX_HEADER_READ_WORKERS, len(items))) as executor:
+            return list(executor.map(function, items))
 
     def _requirements_from_fingerprint(
         self,
@@ -509,14 +693,13 @@ class HuggingFaceService:
         )
 
         resolved: set[str] = set()
-        for filename in fingerprint_candidates[:max_fingerprint_files]:
-            try:
-                metadata = self.api.parse_safetensors_file_metadata(model_id, filename)
-            except (HfHubHTTPError, OSError) as error:
-                notes.append(f"could not read tensor metadata for {filename} ({error})")
+        to_read = fingerprint_candidates[:max_fingerprint_files]
+        headers = self._read_headers(model_id, to_read, notes)
+        for filename in to_read:
+            if filename not in headers:
                 continue
 
-            identified = identify_by_tensor_names(list(metadata.tensors.keys()))
+            identified = identify_by_tensor_names(list(headers[filename]))
             if identified is None:
                 continue
             role_name, architecture, confidence = identified
@@ -608,10 +791,6 @@ class HuggingFaceService:
         if architecture is None:
             return None
         return next((role for role in found.values() if role.architecture == architecture), None)
-
-    @staticmethod
-    def _filenames_with_prefix(filenames: list[str], prefix: str) -> list[str]:
-        return [name[len(prefix) :] for name in filenames if name.startswith(prefix)]
 
     @staticmethod
     def _filenames_by_alias(filenames: list[str], family: FamilyDef | None, role_name: str) -> list[str]:
