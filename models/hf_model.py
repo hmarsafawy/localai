@@ -68,6 +68,9 @@ class HfPipelineComponent(BaseModel):
     class_name: str | None = None
     required: bool = True
     subfolder: str
+    # Set when the index points this component at a different repo (modular
+    # pipelines can); `files`/`subfolder` are then relative to that repo.
+    repo_id: str | None = None
     files: list[HfPipelineFile] = Field(default_factory=list)
     formats: list[str] = Field(default_factory=list)
     config: dict[str, Any] | None = None
@@ -106,7 +109,7 @@ class HfRequirementRole(BaseModel):
     architecture: str | None = None
     required: bool = True
     present: bool = False
-    source: str = "repo"  # "repo" | "base_model" | "fingerprint" | "registry"
+    source: str = "repo"  # "repo" | "external" | "base_model" | "fingerprint" | "registry"
     confidence: str = "high"  # "high" | "low"
     subfolder: str | None = None
     files: list[str] = Field(default_factory=list)

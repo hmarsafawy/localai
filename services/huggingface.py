@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, TypeVar
 
@@ -37,6 +38,11 @@ from services.tensor_signatures import (
 from services.weight_headers import TensorShapes, read_tensor_shapes
 
 MODEL_INDEX_FILENAME = "model_index.json"
+# Modular diffusers pipelines ship this instead. Same component keys, but each
+# entry is `[library, class_name, spec]`, and the spec's repo/subfolder can
+# point outside the component's own folder - or at another repo entirely.
+MODULAR_MODEL_INDEX_FILENAME = "modular_model_index.json"
+PIPELINE_INDEX_FILENAMES = (MODEL_INDEX_FILENAME, MODULAR_MODEL_INDEX_FILENAME)
 
 WEIGHT_FORMATS_BY_EXTENSION = {
     ".safetensors": "safetensors",
@@ -55,6 +61,12 @@ WEIGHT_FORMATS_BY_EXTENSION = {
 # a full download) - only these formats expose tensor names that cheaply.
 FINGERPRINT_EXTENSIONS = (".safetensors", ".gguf")
 
+# transformers' naming convention for weightless preprocessing classes
+# (CLIPTokenizer, T5TokenizerFast, AutoProcessor, CLIPImageProcessor, ...).
+# Modular indexes point these at the same folder as their model, and they must
+# not claim that model's weights as their own files.
+PREPROCESSOR_CLASS_SUFFIXES = ("Tokenizer", "TokenizerFast", "Processor", "FeatureExtractor")
+
 COMPONENT_CONFIG_FILENAMES = (
     "config.json",
     "scheduler_config.json",
@@ -72,6 +84,9 @@ MAX_FINGERPRINT_FILES = 6
 # headers are tiny, so reading all of them is cheap, but keep a ceiling.
 MAX_REPO_MATCH_FILES = 32
 MAX_HEADER_READ_WORKERS = 8
+# Bundled checkpoints nest components up to ~3 segments deep
+# (`text_encoders.clip_l.transformer.`); deeper splits are just layer names.
+MAX_BUNDLE_PREFIX_DEPTH = 3
 
 _Item = TypeVar("_Item")
 _Result = TypeVar("_Result")
@@ -80,11 +95,12 @@ load_dotenv()
 
 
 class ModelIndexNotFoundError(Exception):
-    """Raised when a repo has no `model_index.json` (not a diffusers pipeline)."""
+    """Raised when a repo has no `model_index.json` or `modular_model_index.json`
+    (not a diffusers pipeline)."""
 
     def __init__(self, model_id: str) -> None:
         self.model_id = model_id
-        super().__init__(f"{model_id} does not provide a model_index.json")
+        super().__init__(f"{model_id} does not provide a model_index.json or modular_model_index.json")
 
 
 class HuggingFaceService:
@@ -145,24 +161,16 @@ class HuggingFaceService:
         return HfModel.model_validate(model_data)
 
     def get_pipeline_requirements(self, model_id: str, include_config: bool = True) -> HfPipelineInfo:
-        """Parse a diffusers `model_index.json` and match each declared component
-        against the files actually present in the repo, so callers can see what
-        a pipeline needs (text encoder, VAE, scheduler, ...) and whether it's there."""
-        try:
-            index_path = hf_hub_download(
-                repo_id=model_id, filename=MODEL_INDEX_FILENAME, token=self.token
-            )
-        except EntryNotFoundError as error:
-            raise ModelIndexNotFoundError(model_id) from error
-
-        with open(index_path, encoding="utf-8") as file:
-            index: dict[str, Any] = json.load(file)
+        """Parse a diffusers `model_index.json` (or a modular pipeline's
+        `modular_model_index.json`) and match each declared component against
+        the files actually present, so callers can see what a pipeline needs
+        (text encoder, VAE, scheduler, ...) and whether it's there."""
+        index = self._download_pipeline_index(model_id)
 
         info = self.api.model_info(model_id, files_metadata=True)
-        sibling_sizes = {
-            sibling.rfilename: getattr(sibling, "size", None)
-            for sibling in (getattr(info, "siblings", None) or [])
-        }
+        resolved_id = getattr(info, "id", None) or getattr(info, "modelId", model_id)
+        own_repo_ids = {model_id.lower(), resolved_id.lower()}
+        sizes_by_repo: dict[str, dict[str, int | None]] = {resolved_id: self._sibling_sizes(info)}
 
         components: list[HfPipelineComponent] = []
         missing_components: list[str] = []
@@ -173,25 +181,43 @@ class HuggingFaceService:
                 continue
             if not self._is_component_descriptor(value):
                 # A real component is always `[library, class_name]` (both
-                # strings, or both null when the component is disabled). Any
-                # other list is pipeline config that happens to be list-shaped,
-                # e.g. Krea2Pipeline's `text_encoder_select_layers: [2, 5, ...]`.
+                # strings, or both null when the component is disabled), plus
+                # a spec dict in modular indexes. Any other list is pipeline
+                # config that happens to be list-shaped, e.g. Krea2Pipeline's
+                # `text_encoder_select_layers: [2, 5, ...]`.
                 extra_config[key] = value
                 continue
 
-            library, class_name = value
-            required = class_name is not None
+            library, class_name = value[0], value[1]
+            source_repo: str | None = resolved_id
+            subfolder = key
+            if len(value) == 3:
+                # A spec with no repo is built from config at load time, so
+                # there's nothing to download for it.
+                source_repo = value[2].get("pretrained_model_name_or_path")
+                subfolder = value[2].get("subfolder") or ""
+                if source_repo is not None and source_repo.lower() in own_repo_ids:
+                    source_repo = resolved_id
+            required = class_name is not None and source_repo is not None
 
-            prefix = f"{key}/"
-            files = [
-                HfPipelineFile(filename=name[len(prefix):], size=size)
-                for name, size in sibling_sizes.items()
-                if name.startswith(prefix)
-            ]
-            formats = self._formats_for_files(files)
+            files: list[HfPipelineFile] = []
+            if source_repo is not None:
+                if source_repo not in sizes_by_repo:
+                    sizes_by_repo[source_repo] = self._external_sibling_sizes(source_repo)
+                files = self._files_in_subfolder(sizes_by_repo[source_repo], subfolder)
+            if class_name is not None and class_name.endswith(PREPROCESSOR_CLASS_SUFFIXES):
+                files = [
+                    pipeline_file
+                    for pipeline_file in files
+                    if self._extension(pipeline_file.filename) not in WEIGHT_FORMATS_BY_EXTENSION
+                    and not pipeline_file.filename.endswith(".safetensors.index.json")
+                ]
+            external_repo = source_repo if source_repo not in (None, resolved_id) else None
 
             config_data = (
-                self._download_component_config(model_id, key, files) if include_config else None
+                self._download_component_config(source_repo, subfolder, files)
+                if include_config and source_repo is not None
+                else None
             )
 
             components.append(
@@ -200,9 +226,10 @@ class HuggingFaceService:
                     library=library,
                     class_name=class_name,
                     required=required,
-                    subfolder=key,
+                    subfolder=subfolder,
+                    repo_id=external_repo,
                     files=files,
-                    formats=formats,
+                    formats=self._formats_for_files(files),
                     config=config_data,
                 )
             )
@@ -211,7 +238,7 @@ class HuggingFaceService:
                 missing_components.append(key)
 
         return HfPipelineInfo(
-            model_id=getattr(info, "id", None) or getattr(info, "modelId", model_id),
+            model_id=resolved_id,
             class_name=index.get("_class_name"),
             diffusers_version=index.get("_diffusers_version"),
             components=components,
@@ -219,8 +246,51 @@ class HuggingFaceService:
             extra_config=extra_config,
         )
 
+    def _download_pipeline_index(self, model_id: str) -> dict[str, Any]:
+        for filename in PIPELINE_INDEX_FILENAMES:
+            try:
+                index_path = hf_hub_download(repo_id=model_id, filename=filename, token=self.token)
+            except EntryNotFoundError:
+                continue
+            with open(index_path, encoding="utf-8") as file:
+                return json.load(file)
+        raise ModelIndexNotFoundError(model_id)
+
+    @staticmethod
+    def _sibling_sizes(info: Any) -> dict[str, int | None]:
+        return {
+            sibling.rfilename: getattr(sibling, "size", None)
+            for sibling in (getattr(info, "siblings", None) or [])
+        }
+
+    def _external_sibling_sizes(self, repo_id: str) -> dict[str, int | None]:
+        # A missing/gated component repo shouldn't sink the whole pipeline; it
+        # just shows up as a component with no files. ValueError covers a spec
+        # that names a local path instead of a repo id.
+        try:
+            return self._sibling_sizes(self.api.model_info(repo_id, files_metadata=True))
+        except (HfHubHTTPError, ValueError):
+            return {}
+
+    @staticmethod
+    def _files_in_subfolder(sizes: dict[str, int | None], subfolder: str) -> list[HfPipelineFile]:
+        # An empty subfolder means the repo root: only its top-level files, not
+        # everything nested under it.
+        if not subfolder:
+            return [HfPipelineFile(filename=name, size=size) for name, size in sizes.items() if "/" not in name]
+        prefix = f"{subfolder}/"
+        return [
+            HfPipelineFile(filename=name[len(prefix) :], size=size)
+            for name, size in sizes.items()
+            if name.startswith(prefix)
+        ]
+
+    @staticmethod
+    def _repo_path(subfolder: str, filename: str) -> str:
+        return f"{subfolder}/{filename}" if subfolder else filename
+
     def _download_component_config(
-        self, model_id: str, subfolder: str, files: list[HfPipelineFile]
+        self, repo_id: str, subfolder: str, files: list[HfPipelineFile]
     ) -> dict[str, Any] | None:
         available = {pipeline_file.filename for pipeline_file in files}
         config_name = next((name for name in COMPONENT_CONFIG_FILENAMES if name in available), None)
@@ -228,14 +298,31 @@ class HuggingFaceService:
             return None
         try:
             config_path = hf_hub_download(
-                repo_id=model_id,
-                filename=f"{subfolder}/{config_name}",
+                repo_id=repo_id,
+                filename=self._repo_path(subfolder, config_name),
                 token=self.token,
             )
             with open(config_path, encoding="utf-8") as file:
                 return json.load(file)
         except (HfHubHTTPError, OSError, json.JSONDecodeError):
             return None
+
+    @staticmethod
+    def _class_from_config(config: dict[str, Any] | None) -> tuple[str, str] | None:
+        """(library, class name) a component's own config declares: diffusers
+        writes `_class_name`; transformers writes `architectures` for models and
+        `tokenizer_class`/`processor_class`/`image_processor_type` for the rest."""
+        if not config:
+            return None
+        if isinstance(config.get("_class_name"), str):
+            return "diffusers", config["_class_name"]
+        architectures = config.get("architectures")
+        if isinstance(architectures, list) and architectures and isinstance(architectures[0], str):
+            return "transformers", architectures[0]
+        for key in ("tokenizer_class", "processor_class", "image_processor_type"):
+            if isinstance(config.get(key), str):
+                return "transformers", config[key]
+        return None
 
     def get_model_requirements(
         self,
@@ -245,15 +332,30 @@ class HuggingFaceService:
         max_fingerprint_files: int = MAX_FINGERPRINT_FILES,
     ) -> HfModelRequirements:
         """Best-effort answer to "what does this model need to run" for repos that
-        don't ship a `model_index.json` (GGUF quantizations, bare component repos,
+        don't ship a pipeline index (GGUF quantizations, bare component repos,
         single-file checkpoints, ...). Falls back through the repo's `base_model`
-        ancestry, then weight tensor-name fingerprinting, then a small curated
-        table of known pipeline families."""
+        ancestry, then the per-subfolder configs of a diffusers-layout repo, then
+        weight tensor-name fingerprinting plus a small curated table of known
+        pipeline families."""
         try:
             pipeline = self.get_pipeline_requirements(model_id, include_config=False)
             return self._requirements_from_direct_pipeline(pipeline)
         except ModelIndexNotFoundError:
             pass
+        except HfHubHTTPError as error:
+            # Gated repo whose license the token hasn't accepted: the file
+            # listing is still public, which is enough for the pipeline shape.
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            coarse = self._coarse_pipeline_from_metadata(model_id) if status in (401, 403) else None
+            if coarse is None:
+                raise
+            return self._requirements_from_direct_pipeline(
+                coarse,
+                notes=[
+                    f"{model_id} is gated and its license hasn't been accepted for this token; used its "
+                    "public file listing, so component classes and optional components are unknown"
+                ],
+            )
 
         info = self.api.model_info(model_id, files_metadata=True)
         target_filenames = [sibling.rfilename for sibling in (getattr(info, "siblings", None) or [])]
@@ -270,15 +372,47 @@ class HuggingFaceService:
                 model_id, resolved_pipeline, resolved_from, target_filenames, info, fingerprint, notes
             )
 
+        # The repo's own component configs say exactly what each part is, which
+        # beats guessing a family from its name - "flux" in a repo id says
+        # nothing about which generation's text encoders it uses.
+        self_described = self._pipeline_from_component_configs(model_id, info)
+        if self_described is not None:
+            notes.append("no pipeline index; components were read from each subfolder's own config")
+            return self._requirements_from_ancestor_pipeline(
+                model_id, self_described, None, target_filenames, info, fingerprint, notes
+            )
+
         return self._requirements_from_fingerprint(
             model_id, info, target_filenames, fingerprint, max_fingerprint_files, notes
         )
 
-    def _requirements_from_direct_pipeline(self, pipeline: HfPipelineInfo) -> HfModelRequirements:
+    def _requirements_from_direct_pipeline(
+        self, pipeline: HfPipelineInfo, notes: list[str] | None = None
+    ) -> HfModelRequirements:
         family = match_family_by_class(pipeline.class_name)
         roles: list[HfRequirementRole] = []
         for component in pipeline.components:
-            present = bool(component.files)
+            files = [pipeline_file.filename for pipeline_file in component.files]
+            if component.repo_id is not None:
+                roles.append(
+                    HfRequirementRole(
+                        role=component.name,
+                        architecture=component.class_name,
+                        required=component.required,
+                        present=False,
+                        source="external",
+                        sources=[
+                            HfSuggestedSource(
+                                repo_id=component.repo_id,
+                                files=[self._repo_path(component.subfolder, name) for name in files],
+                                note="the pipeline index loads this component from another repo",
+                            )
+                        ],
+                    )
+                )
+                continue
+
+            present = bool(files)
             sources: list[HfSuggestedSource] = []
             if component.required and not present:
                 sources = self._registry_sources_for_role(family, component.name)
@@ -289,8 +423,8 @@ class HuggingFaceService:
                     required=component.required,
                     present=present,
                     source="repo",
-                    subfolder=component.subfolder,
-                    files=[pipeline_file.filename for pipeline_file in component.files],
+                    subfolder=component.subfolder or None,
+                    files=files,
                     sources=sources,
                 )
             )
@@ -300,6 +434,7 @@ class HuggingFaceService:
             pipeline_class=pipeline.class_name,
             resolved_from=None,
             roles=roles,
+            notes=notes or [],
         )
 
     @staticmethod
@@ -359,15 +494,6 @@ class HuggingFaceService:
         if class_name is None:
             return None
 
-        grouped: dict[str, list[HfPipelineFile]] = {}
-        for sibling in getattr(info, "siblings", None) or []:
-            subfolder, separator, filename = sibling.rfilename.partition("/")
-            if not separator:
-                continue
-            grouped.setdefault(subfolder, []).append(
-                HfPipelineFile(filename=filename, size=getattr(sibling, "size", None))
-            )
-
         components = [
             HfPipelineComponent(
                 name=subfolder,
@@ -378,7 +504,7 @@ class HuggingFaceService:
                 files=files,
                 formats=self._formats_for_files(files),
             )
-            for subfolder, files in grouped.items()
+            for subfolder, files in self._files_by_subfolder(info).items()
         ]
         return HfPipelineInfo(
             model_id=getattr(info, "id", None) or model_id,
@@ -386,6 +512,57 @@ class HuggingFaceService:
             diffusers_version=None,
             components=components,
         )
+
+    def _pipeline_from_component_configs(self, model_id: str, info: Any) -> HfPipelineInfo | None:
+        """For a repo laid out the diffusers way (`transformer/`, `vae/`,
+        `text_encoder/`, ...) that just never wrote a pipeline index: each
+        subfolder's own config still names its class, which is all the index
+        would have said. Only used when at least one subfolder is a diffusers
+        component - a lone transformers folder next to, say, a single-file
+        checkpoint isn't a pipeline layout, and treating it as one would leave
+        that checkpoint to fingerprinting against the wrong reference."""
+        candidates = [
+            (subfolder, files)
+            for subfolder, files in self._files_by_subfolder(info).items()
+            if any(pipeline_file.filename in COMPONENT_CONFIG_FILENAMES for pipeline_file in files)
+        ]
+        configs = self._run_parallel(
+            lambda candidate: self._download_component_config(model_id, *candidate), candidates
+        )
+
+        components: list[HfPipelineComponent] = []
+        for (subfolder, files), config in zip(candidates, configs):
+            declared = self._class_from_config(config)
+            if declared is None:
+                continue
+            library, class_name = declared
+            components.append(
+                HfPipelineComponent(
+                    name=subfolder,
+                    library=library,
+                    class_name=class_name,
+                    required=True,
+                    subfolder=subfolder,
+                    files=files,
+                    formats=self._formats_for_files(files),
+                )
+            )
+
+        if not any(component.library == "diffusers" for component in components):
+            return None
+        return HfPipelineInfo(model_id=getattr(info, "id", None) or model_id, components=components)
+
+    @staticmethod
+    def _files_by_subfolder(info: Any) -> dict[str, list[HfPipelineFile]]:
+        grouped: dict[str, list[HfPipelineFile]] = {}
+        for sibling in getattr(info, "siblings", None) or []:
+            subfolder, separator, filename = sibling.rfilename.partition("/")
+            if not separator:
+                continue
+            grouped.setdefault(subfolder, []).append(
+                HfPipelineFile(filename=filename, size=getattr(sibling, "size", None))
+            )
+        return grouped
 
     def _resolve_from_base_model(
         self, model_id: str, info: Any, max_depth: int = MAX_BASE_MODEL_CHAIN_DEPTH
@@ -437,15 +614,25 @@ class HuggingFaceService:
         self,
         model_id: str,
         pipeline: HfPipelineInfo,
-        resolved_from: str,
+        resolved_from: str | None,
         target_filenames: list[str],
         info: Any,
         fingerprint: bool,
         notes: list[str],
     ) -> HfModelRequirements:
-        family = match_family_by_class(pipeline.class_name) or match_family_by_keywords(
-            model_id, " ".join(getattr(info, "tags", None) or [])
-        )
+        # No `resolved_from` means the pipeline was read from this repo itself,
+        # so its loose files are compared against its own components.
+        reference_repo = resolved_from or model_id
+        family = match_family_by_class(pipeline.class_name)
+        if family is None:
+            # A name keyword only stands in for an unlisted pipeline class if
+            # the pipeline's own components belong to that family - "flux" in
+            # a FLUX.3 repo must not pull in FLUX.1's filename aliases.
+            guess = match_family_by_keywords(model_id, " ".join(getattr(info, "tags", None) or []))
+            if guess is not None and any(
+                self._family_has_architecture(guess, component.class_name) for component in pipeline.components
+            ):
+                family = guess
         roles: list[HfRequirementRole] = []
 
         # Full repo paths claimed per component by folder name or filename alias.
@@ -457,11 +644,19 @@ class HuggingFaceService:
                 own_files = self._filenames_by_alias(target_filenames, family, component.name)
             own_files_by_component[component.name] = own_files
         claimed = {name for files in own_files_by_component.values() for name in files}
+        in_component_folders = {
+            name
+            for component in pipeline.components
+            for name in target_filenames
+            if name.startswith(f"{component.name}/")
+        }
 
-        # Anything left over that the name-based passes couldn't place (e.g.
-        # `text_encoders/qwen3vl_8b_bf16.safetensors`, a root-level GGUF of the
-        # transformer) is compared by tensor names against the base model's own
-        # components, so the repo's copies win before the base model is suggested.
+        # Every weight file outside the components' own folders is compared by
+        # tensor names against the base model's components, so the repo's
+        # copies win before the base model is suggested. That includes files a
+        # filename alias already placed: a name only says what a file is
+        # *mainly*, and an all-in-one checkpoint named after its transformer
+        # (`flux1-dev-fp8.safetensors`) also carries the text encoders and VAE.
         matched: dict[str, list[tuple[str, ReferenceMatch]]] = {}
         lora_files: list[str] = []
         unidentified: list[str] = []
@@ -469,16 +664,34 @@ class HuggingFaceService:
             candidates = [
                 name
                 for name in target_filenames
-                if name not in claimed and self._extension(name) in FINGERPRINT_EXTENSIONS
+                if name not in in_component_folders and self._extension(name) in FINGERPRINT_EXTENSIONS
             ]
             if candidates:
                 matched, lora_files, unidentified = self._match_files_to_components(
-                    model_id, pipeline, resolved_from, candidates, notes
+                    model_id, pipeline, reference_repo, candidates, notes
+                )
+                unidentified = [name for name in unidentified if name not in claimed]
+                lora_files = [name for name in lora_files if name not in claimed]
+
+        components_by_file: dict[str, list[str]] = {}
+        for component_name, files in own_files_by_component.items():
+            for filename in files:
+                components_by_file.setdefault(filename, []).append(component_name)
+        for component_name, files in matched.items():
+            for filename, _ in files:
+                if component_name not in components_by_file.setdefault(filename, []):
+                    components_by_file[filename].append(component_name)
+        for filename, component_names in components_by_file.items():
+            if len(component_names) > 1:
+                notes.append(
+                    f"{filename} bundles several components in one file ({', '.join(component_names)})"
                 )
 
         for component in pipeline.components:
             own_files = own_files_by_component[component.name]
-            fingerprinted = matched.get(component.name, [])
+            fingerprinted = [
+                (filename, match) for filename, match in matched.get(component.name, []) if filename not in own_files
+            ]
 
             if own_files or fingerprinted:
                 prefix = f"{component.name}/"
@@ -507,24 +720,31 @@ class HuggingFaceService:
                 if len(full_copies) > 1:
                     notes.append(
                         f"{component.name}: {len(full_copies)} files each hold the complete component "
-                        "(different precisions/quantizations) - only one of them is needed"
+                        "(different precisions/quantizations/variants) - only one of them is needed"
                     )
-                for filename, match in fingerprinted:
-                    if match.confidence == "low":
-                        notes.append(
-                            f"{filename} only partially matches {resolved_from}'s {component.name} "
-                            f"(by {match.method}, {match.reference_coverage:.0%} of its tensors) - "
-                            "likely a restructured/converted copy that needs a matching loader"
-                        )
+                converted = [filename for filename, match in fingerprinted if match.confidence == "low"]
+                if converted:
+                    notes.append(
+                        f"{component.name}: {len(converted)} file(s) only partially match {reference_repo}'s "
+                        "tensor names (renamed, fused or repacked layers) - likely converted copies, e.g. "
+                        "ComfyUI/native format, that need a loader for that format: " + ", ".join(converted)
+                    )
                 continue
 
             sources: list[HfSuggestedSource] = []
             if component.files:
                 sources.append(
                     HfSuggestedSource(
-                        repo_id=resolved_from,
-                        files=[pipeline_file.filename for pipeline_file in component.files],
-                        note=f"shipped in the base model's {component.subfolder}/ folder",
+                        repo_id=component.repo_id or reference_repo,
+                        files=[
+                            self._repo_path(component.subfolder, pipeline_file.filename)
+                            for pipeline_file in component.files
+                        ],
+                        note=(
+                            "the pipeline index loads this component from another repo"
+                            if component.repo_id
+                            else "shipped in the base model"
+                        ),
                     )
                 )
             sources.extend(self._registry_sources_for_role(family, component.name))
@@ -535,7 +755,9 @@ class HuggingFaceService:
                     architecture=component.class_name,
                     required=component.required,
                     present=False,
-                    source="base_model" if component.files else "registry",
+                    source=(
+                        "external" if component.repo_id else "base_model" if component.files else "registry"
+                    ),
                     files=[],
                     sources=sources,
                 )
@@ -589,6 +811,7 @@ class HuggingFaceService:
         headers = self._read_headers(model_id, to_read, notes)
         matched: dict[str, list[tuple[str, ReferenceMatch]]] = {}
         lora_files: list[str] = []
+        unmatched: list[str] = []
         for filename in to_read:
             shapes = headers.get(filename)
             if not shapes:
@@ -598,53 +821,141 @@ class HuggingFaceService:
                 lora_files.append(filename)
                 continue
 
-            best: tuple[str, ReferenceMatch] | None = None
-            for component_name, (reference_keys, reference_shapes) in references.items():
-                match = match_reference(shapes, reference_keys, reference_shapes)
-                if match is not None and (best is None or match.score > best[1].score):
-                    best = (component_name, match)
+            found = self._match_tensor_groups(shapes, references)
+            if not found:
+                unmatched.append(filename)
+                continue
+            for component_name, match in found.items():
+                matched.setdefault(component_name, []).append((filename, match))
+
+        # Quantized siblings often can't be matched to the reference directly
+        # (renamed scheme *and* changed shapes, or fused layers), but they keep
+        # the naming of the full-precision file next to them. So compare what's
+        # left against files this repo already resolved: a match inherits that
+        # file's component, and only stays high-confidence if both links are.
+        # Bundles are left out: matching one says nothing about which of its
+        # components the file resembles.
+        components_per_file = Counter(filename for files in matched.values() for filename, _ in files)
+        peers = {
+            filename: (component_name, match)
+            for component_name, files in matched.items()
+            for filename, match in files
+            if components_per_file[filename] == 1
+        }
+        for filename in unmatched:
+            best = self._best_reference_match(
+                headers[filename],
+                {peer: (list(headers[peer]), headers[peer]) for peer in peers},
+            )
             if best is None:
                 unidentified.append(filename)
                 continue
-            matched.setdefault(best[0], []).append((filename, best[1]))
+            peer_name, peer_match = best
+            component_name, reference_match = peers[peer_name]
+            confident = peer_match.confidence == "high" and reference_match.confidence == "high"
+            matched[component_name].append(
+                (
+                    filename,
+                    ReferenceMatch(
+                        peer_match.candidate_coverage,
+                        min(peer_match.reference_coverage, reference_match.reference_coverage),
+                        "high" if confident else "low",
+                        f"{peer_match.method} via {peer_name}",
+                    ),
+                )
+            )
 
         return matched, lora_files, unidentified
+
+    @classmethod
+    def _match_tensor_groups(
+        cls,
+        shapes: TensorShapes,
+        references: dict[str, tuple[list[str], TensorShapes | None]],
+        depth: int = 0,
+    ) -> dict[str, ReferenceMatch]:
+        """Which reference components a file holds. Normally the whole file
+        matches one; if not, it may be a bundle (ComfyUI/A1111 all-in-one
+        checkpoints nest each part under its own prefix: `model.diffusion_model.`,
+        `text_encoders.clip_l.`, `vae.`), so its tensors are split by leading
+        name segment and each group is matched on its own, a few levels deep."""
+        best = cls._best_reference_match(shapes, references)
+        if best is not None:
+            return {best[0]: best[1]}
+        if depth >= MAX_BUNDLE_PREFIX_DEPTH:
+            return {}
+
+        groups: dict[str, TensorShapes] = {}
+        for key, shape in shapes.items():
+            head, separator, rest = key.partition(".")
+            # A numbered segment is a layer index (`double_blocks.0.`), never a
+            # component container, and splitting there is most of the cost.
+            if separator and not head.isdigit():
+                groups.setdefault(head, {})[rest] = shape
+        found: dict[str, ReferenceMatch] = {}
+        for group in groups.values():
+            for component_name, match in cls._match_tensor_groups(group, references, depth + 1).items():
+                if component_name not in found or match.score > found[component_name].score:
+                    found[component_name] = match
+        return found
+
+    @staticmethod
+    def _best_reference_match(
+        shapes: TensorShapes, references: dict[str, tuple[list[str], TensorShapes | None]]
+    ) -> tuple[str, ReferenceMatch] | None:
+        best: tuple[str, ReferenceMatch] | None = None
+        for name, (reference_keys, reference_shapes) in references.items():
+            match = match_reference(shapes, reference_keys, reference_shapes)
+            if match is not None and (best is None or match.score > best[1].score):
+                best = (name, match)
+        return best
 
     def _component_references(
         self, repo_id: str, pipeline: HfPipelineInfo, notes: list[str]
     ) -> dict[str, tuple[list[str], TensorShapes | None]]:
-        """Tensor names (and shapes, when cheaply available) of each weight-bearing
-        component in a diffusers repo. A sharded component's `*.index.json`
-        already lists every tensor name in one small download, so that's
-        preferred over reading each shard's header (at the cost of shapes)."""
+        """Tensor names and shapes of each weight-bearing component in a
+        diffusers repo, read from every shard's header. A sharded component's
+        `*.index.json` would list the names in one download, but without shapes
+        a copy saved under another naming scheme (a ComfyUI/BFL-native
+        transformer vs the diffusers one: same tensors, different names) can't
+        be recognised, and that's exactly the copy derived repos tend to ship."""
+        # Modular indexes can point two components at one folder (a tokenizer
+        # sharing `text_encoder/`); its weights only need reading once.
+        weight_files: list[tuple[str, str, str]] = []  # (component, repo, path)
+        seen_locations: set[tuple[str, str]] = set()
+        for component in pipeline.components:
+            source_repo = component.repo_id or repo_id
+            location = (source_repo, component.subfolder)
+            if location in seen_locations:
+                continue
+            seen_locations.add(location)
+            weight_files.extend(
+                (component.name, source_repo, self._repo_path(component.subfolder, pipeline_file.filename))
+                for pipeline_file in component.files
+                if self._extension(pipeline_file.filename) in FINGERPRINT_EXTENSIONS
+            )
 
-        def load(component: HfPipelineComponent) -> tuple[list[str], TensorShapes | None] | None:
-            names = [pipeline_file.filename for pipeline_file in component.files]
-            index_name = next((name for name in names if name.endswith(".safetensors.index.json")), None)
+        def read(weight_file: tuple[str, str, str]) -> TensorShapes | None:
+            component_name, source_repo, path = weight_file
             try:
-                if index_name is not None:
-                    index_path = hf_hub_download(
-                        repo_id=repo_id, filename=f"{component.subfolder}/{index_name}", token=self.token
-                    )
-                    with open(index_path, encoding="utf-8") as file:
-                        return list(json.load(file).get("weight_map", {})), None
-                shapes: TensorShapes = {}
-                for name in names:
-                    if self._extension(name) == ".safetensors":
-                        shapes.update(
-                            read_tensor_shapes(self.api, self.token, repo_id, f"{component.subfolder}/{name}")
-                        )
-                return (list(shapes), shapes) if shapes else None
+                return read_tensor_shapes(self.api, self.token, source_repo, path)
             except (HfHubHTTPError, OSError, ValueError) as error:
-                notes.append(f"could not read {repo_id}'s {component.name} tensor list ({error})")
+                notes.append(f"could not read {source_repo}'s {component_name} tensor list ({error})")
                 return None
 
-        components = [component for component in pipeline.components if component.files]
-        loaded = self._run_parallel(load, components)
+        shapes_by_component: dict[str, TensorShapes] = {}
+        failed: set[str] = set()
+        for (component_name, _, _), shapes in zip(weight_files, self._run_parallel(read, weight_files)):
+            if shapes is None:
+                # A reference missing a shard would make every full copy look
+                # partial, so drop the component rather than compare against it.
+                failed.add(component_name)
+                continue
+            shapes_by_component.setdefault(component_name, {}).update(shapes)
         return {
-            component.name: reference
-            for component, reference in zip(components, loaded)
-            if reference is not None
+            name: (list(shapes), shapes)
+            for name, shapes in shapes_by_component.items()
+            if name not in failed and shapes
         }
 
     def _read_headers(self, repo_id: str, filenames: list[str], notes: list[str]) -> dict[str, TensorShapes]:
@@ -679,6 +990,11 @@ class HuggingFaceService:
     ) -> HfModelRequirements:
         tags = getattr(info, "tags", None) or []
         family = match_family_by_keywords(model_id, " ".join(tags))
+        # A keyword hit ("flux" in "flux-3-...") can't tell a family's
+        # generations apart, so on its own it's only a guess. A fingerprinted
+        # architecture or a brand-specific filename from that family confirms it.
+        family_confirmed = False
+        registry_roles: set[str] = set()
 
         found: dict[str, HfRequirementRole] = {}
         unidentified: list[str] = []
@@ -704,6 +1020,8 @@ class HuggingFaceService:
                 continue
             role_name, architecture, confidence = identified
             resolved.add(filename)
+            if family is not None and self._family_has_architecture(family, architecture):
+                family_confirmed = True
 
             existing = self._find_role_with_architecture(found, architecture)
             if existing is not None:
@@ -725,14 +1043,12 @@ class HuggingFaceService:
             if filename in resolved:
                 continue
 
-            if family is not None:
-                role_def = match_filename_alias_in_family(filename, family)
-            else:
-                match = match_filename_alias(filename)
-                if match is not None:
-                    family, role_def = match
-                else:
-                    role_def = None
+            discovered = match_filename_alias(filename)
+            if family is None and discovered is not None:
+                family = discovered[0]
+            if discovered is not None and discovered[0] is family:
+                family_confirmed = True
+            role_def = match_filename_alias_in_family(filename, family) if family is not None else None
 
             if role_def is None:
                 unidentified.append(filename)
@@ -743,6 +1059,7 @@ class HuggingFaceService:
                 existing.files.append(filename)
                 continue
 
+            registry_roles.add(role_def.role)
             found[role_def.role] = HfRequirementRole(
                 role=role_def.role,
                 architecture=role_def.architecture,
@@ -756,6 +1073,7 @@ class HuggingFaceService:
             for role_def in family.roles:
                 if role_def.role in found:
                     continue
+                registry_roles.add(role_def.role)
                 found[role_def.role] = HfRequirementRole(
                     role=role_def.role,
                     architecture=role_def.architecture,
@@ -763,6 +1081,14 @@ class HuggingFaceService:
                     present=False,
                     source="registry",
                     sources=self._registry_sources_for_role(family, role_def.role),
+                )
+            if not family_confirmed and registry_roles:
+                for role_name in registry_roles:
+                    found[role_name].confidence = "low"
+                notes.append(
+                    f"the '{family.name}' family was guessed from the repo name/tags only - no weight file "
+                    "confirms it, so its expected roles and architectures may belong to a different "
+                    "generation of the model"
                 )
 
         return HfModelRequirements(
@@ -793,6 +1119,10 @@ class HuggingFaceService:
         return next((role for role in found.values() if role.architecture == architecture), None)
 
     @staticmethod
+    def _family_has_architecture(family: FamilyDef, architecture: str | None) -> bool:
+        return architecture is not None and any(role.architecture == architecture for role in family.roles)
+
+    @staticmethod
     def _filenames_by_alias(filenames: list[str], family: FamilyDef | None, role_name: str) -> list[str]:
         aliases: tuple[str, ...] = (role_name,)
         if family is not None:
@@ -817,11 +1147,11 @@ class HuggingFaceService:
 
     @staticmethod
     def _is_component_descriptor(value: Any) -> bool:
-        return (
-            isinstance(value, list)
-            and len(value) == 2
-            and all(item is None or isinstance(item, str) for item in value)
-        )
+        if not isinstance(value, list):
+            return False
+        if len(value) == 3 and isinstance(value[2], dict):
+            value = value[:2]
+        return len(value) == 2 and all(item is None or isinstance(item, str) for item in value)
 
     @staticmethod
     def _extension(filename: str) -> str:

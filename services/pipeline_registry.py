@@ -131,7 +131,7 @@ FAMILIES: tuple[FamilyDef, ...] = (
                 "transformer", "SD3Transformer2DModel", True, ("sd3", "transformer"), discovery_aliases=("sd3",)
             ),
             RegistryRole("vae", "AutoencoderKL", True, ("vae",)),
-            RegistryRole("text_encoder", "CLIPTextModel", True, ("clip_l", "clip-l")),
+            RegistryRole("text_encoder", "CLIPTextModelWithProjection", True, ("clip_l", "clip-l")),
             RegistryRole("text_encoder_2", "CLIPTextModelWithProjection", True, ("clip_g", "clip-g")),
             RegistryRole(
                 "text_encoder_3",

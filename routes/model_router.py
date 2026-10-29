@@ -61,14 +61,14 @@ async def get_model_requirements(
 
 @router.get("/{model_id:path}/pipeline", response_model=HfPipelineResponse)
 async def get_model_pipeline(model_id: str, include_config: bool = Query(default=True)) -> HfPipelineInfo:
-    """Parse the repo's `model_index.json` and report what the pipeline needs
+    """Parse the repo's `model_index.json` (or `modular_model_index.json`) and report what the pipeline needs
     (text encoder, VAE, scheduler, ...) plus whether each piece is actually in the repo."""
     try:
         return await to_thread.run_sync(service.get_pipeline_requirements, model_id, include_config)
     except ModelIndexNotFoundError as error:
         raise HTTPException(
             status_code=404,
-            detail="Repository does not have a model_index.json (not a diffusers pipeline)",
+            detail="Repository has no model_index.json or modular_model_index.json (not a diffusers pipeline)",
         ) from error
     except HfHubHTTPError as error:
         raise _map_hf_error(error) from error
