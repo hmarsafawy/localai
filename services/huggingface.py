@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, TypeVar
@@ -36,7 +37,7 @@ from services.tensor_signatures import (
     is_lora,
     match_reference,
 )
-from services.weight_headers import TensorShapes, read_tensor_shapes
+from services.weight_headers import TensorShapes, read_gguf_metadata, read_tensor_shapes
 
 MODEL_INDEX_FILENAME = "model_index.json"
 # Modular diffusers pipelines ship this instead. Same component keys, but each
@@ -72,6 +73,12 @@ VISION_FILENAME_HINTS = (MMPROJ_FILENAME_HINT, "vision", "visual", "projector", 
 # Roles a fingerprinted LLM is a text encoder for rather than a model in its own right.
 DIFFUSION_ROLES = ("transformer", "unet", "vae")
 MAX_VISION_CONFIG_REPOS = 2
+
+# llama.cpp's split naming; only the first shard carries the model's metadata.
+GGUF_SPLIT_PATTERN = re.compile(r"^(?P<stem>.+)-(?P<part>\d{5})-of-(?P<count>\d{5})\.gguf$", re.IGNORECASE)
+# Leading-metadata probes (one ~64KB range request each) used to group a GGUF
+# repo's quantizations before any full header read.
+MAX_GGUF_PROBES = 64
 
 # transformers' naming convention for weightless preprocessing classes
 # (CLIPTokenizer, T5TokenizerFast, AutoProcessor, CLIPImageProcessor, ...).
@@ -1053,11 +1060,18 @@ class HuggingFaceService:
             else []
         )
         fingerprint_candidates.sort(key=lambda name: not self._has_vision_hint(name))
+        variants = self._group_gguf_variants(model_id, fingerprint_candidates)
+        grouped = {name for members in variants.values() for name in members}
+        fingerprint_candidates = [name for name in fingerprint_candidates if name not in grouped]
 
         resolved: set[str] = set()
         to_read = fingerprint_candidates[:max_fingerprint_files]
         headers = self._read_headers(model_id, to_read, notes)
-        units.extend(([filename], list(headers[filename])) for filename in to_read if filename in headers)
+        units.extend(
+            ([filename, *variants.get(filename, [])], list(headers[filename]))
+            for filename in to_read
+            if filename in headers
+        )
         for files, tensor_keys in units:
             identified = identify_by_tensor_names(tensor_keys)
             if identified is None:
@@ -1215,6 +1229,54 @@ class HuggingFaceService:
             return next((role for role in found.values() if role.architecture == architecture), None)
         existing = found.get(role_name)
         return existing if existing is not None and existing.architecture is None else None
+
+    def _group_gguf_variants(self, repo_id: str, candidates: list[str]) -> dict[str, list[str]]:
+        """GGUF repos ship one model in many quantizations, and an LLM GGUF's
+        header embeds its tokenizer (megabytes), so reading every file's tensor
+        table isn't viable. Instead each file's leading metadata is probed and
+        files with the same architecture and width are taken to be one model,
+        with only the first (in `candidates` order) left to be read. Later
+        shards of a split GGUF have no metadata of their own and join their
+        first shard by name. Returns representative -> the files it stands for."""
+        variants: dict[str, list[str]] = {}
+        first_shards: dict[tuple[str, str], str] = {}
+        to_probe: list[str] = []
+        for name in candidates:
+            if self._extension(name) != ".gguf":
+                continue
+            split = GGUF_SPLIT_PATTERN.match(name)
+            if split is None:
+                to_probe.append(name)
+                continue
+            key = (split["stem"].lower(), split["count"])
+            if key in first_shards:
+                variants[first_shards[key]].append(name)
+            else:
+                first_shards[key] = name
+                variants[name] = []
+                to_probe.append(name)
+
+        def probe(name: str) -> tuple[str, Any] | None:
+            try:
+                metadata = read_gguf_metadata(self.token, repo_id, name)
+            except (HfHubHTTPError, OSError, ValueError):
+                return None
+            architecture = metadata.get("general.architecture")
+            if not isinstance(architecture, str):
+                return None
+            return architecture, metadata.get(f"{architecture}.embedding_length")
+
+        to_probe = to_probe[:MAX_GGUF_PROBES]
+        representatives: dict[tuple[str, Any], str] = {}
+        for name, signature in zip(to_probe, self._run_parallel(probe, to_probe)):
+            if signature is None:
+                continue
+            if signature not in representatives:
+                representatives[signature] = name
+                continue
+            representative = representatives[signature]
+            variants.setdefault(representative, []).extend([name, *variants.pop(name, [])])
+        return {name: members for name, members in variants.items() if members}
 
     @staticmethod
     def _is_text_encoder_role(role_name: str) -> bool:

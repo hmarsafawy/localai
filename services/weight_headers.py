@@ -18,10 +18,14 @@ from huggingface_hub import HfApi, get_session, hf_hub_url
 from huggingface_hub.utils import build_hf_headers, hf_raise_for_status
 
 TensorShapes = dict[str, tuple[int, ...]]
+GgufMetadata = dict[str, str | int | float | bool]
 
 GGUF_MAGIC = b"GGUF"
 GGUF_INITIAL_FETCH_BYTES = 256 * 1024
 GGUF_MAX_FETCH_BYTES = 64 * 1024 * 1024
+# `general.*` and architecture keys come before the tokenizer, so a small
+# prefix holds them even when the full header runs to megabytes.
+GGUF_METADATA_FETCH_BYTES = 64 * 1024
 
 # GGUF metadata value types -> struct format. 8 (string) and 9 (array) are
 # variable-length and handled separately.
@@ -72,10 +76,8 @@ class _GgufCursor:
             raise ValueError(f"unknown GGUF metadata value type {value_type}")
 
 
-def parse_gguf_tensor_shapes(data: bytes) -> TensorShapes:
-    """Parse tensor names/shapes out of the leading bytes of a GGUF file.
-    Raises `_NeedMoreBytes` if `data` stops before the tensor table does."""
-    cursor = _GgufCursor(data)
+def _read_gguf_preamble(cursor: _GgufCursor) -> tuple[int, int]:
+    """Magic and version; returns (tensor count, metadata key/value count)."""
     if cursor.take(4) != GGUF_MAGIC:
         raise ValueError("not a GGUF file")
     version = cursor.unpack("I")
@@ -83,9 +85,35 @@ def parse_gguf_tensor_shapes(data: bytes) -> TensorShapes:
         # v1 used 32-bit counts/lengths throughout; it predates every GGUF on
         # the Hub worth fingerprinting.
         raise ValueError(f"unsupported GGUF version {version}")
+    return int(cursor.unpack("Q")), int(cursor.unpack("Q"))
 
-    tensor_count = int(cursor.unpack("Q"))
-    kv_count = int(cursor.unpack("Q"))
+
+def parse_gguf_metadata(data: bytes) -> GgufMetadata:
+    """Scalar and string metadata values from the leading bytes of a GGUF
+    file, as far as `data` reaches; arrays (the tokenizer) are skipped."""
+    cursor = _GgufCursor(data)
+    _, kv_count = _read_gguf_preamble(cursor)
+    metadata: GgufMetadata = {}
+    try:
+        for _ in range(kv_count):
+            key = cursor.string()
+            value_type = int(cursor.unpack("I"))
+            if value_type == _GGUF_STRING:
+                metadata[key] = cursor.string()
+            elif value_type in _GGUF_SCALAR_FORMATS:
+                metadata[key] = cursor.unpack(_GGUF_SCALAR_FORMATS[value_type])
+            else:
+                cursor.skip_value(value_type)
+    except _NeedMoreBytes:
+        pass
+    return metadata
+
+
+def parse_gguf_tensor_shapes(data: bytes) -> TensorShapes:
+    """Parse tensor names/shapes out of the leading bytes of a GGUF file.
+    Raises `_NeedMoreBytes` if `data` stops before the tensor table does."""
+    cursor = _GgufCursor(data)
+    tensor_count, kv_count = _read_gguf_preamble(cursor)
     for _ in range(kv_count):
         cursor.string()
         cursor.skip_value(int(cursor.unpack("I")))
@@ -111,15 +139,25 @@ def read_tensor_shapes(api: HfApi, token: str | None, repo_id: str, filename: st
     raise ValueError(f"cannot read tensor names from {extension} files")
 
 
+def read_gguf_metadata(token: str | None, repo_id: str, filename: str) -> GgufMetadata:
+    """The leading metadata of a remote GGUF (`general.architecture`, the
+    architecture's dimensions, ...) from one small range request - enough to
+    tell which model a file holds without its multi-MB tensor table."""
+    return parse_gguf_metadata(_fetch_prefix(token, repo_id, filename, GGUF_METADATA_FETCH_BYTES))
+
+
+def _fetch_prefix(token: str | None, repo_id: str, filename: str, size: int) -> bytes:
+    headers = build_hf_headers(token=token)
+    headers["Range"] = f"bytes=0-{size - 1}"
+    response = get_session().get(hf_hub_url(repo_id, filename), headers=headers)
+    hf_raise_for_status(response)
+    return response.content
+
+
 def _read_gguf_tensor_shapes(token: str | None, repo_id: str, filename: str) -> TensorShapes:
-    url = hf_hub_url(repo_id, filename)
     size = GGUF_INITIAL_FETCH_BYTES
     while True:
-        headers = build_hf_headers(token=token)
-        headers["Range"] = f"bytes=0-{size - 1}"
-        response = get_session().get(url, headers=headers)
-        hf_raise_for_status(response)
-        data = response.content
+        data = _fetch_prefix(token, repo_id, filename, size)
         try:
             return parse_gguf_tensor_shapes(data)
         except _NeedMoreBytes:
