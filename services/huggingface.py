@@ -33,6 +33,7 @@ from services.tensor_signatures import (
     HIGH_CONFIDENCE_COVERAGE,
     ReferenceMatch,
     has_vision_tensors,
+    identify_by_gguf_metadata,
     identify_by_tensor_names,
     is_lora,
     match_reference,
@@ -79,6 +80,9 @@ GGUF_SPLIT_PATTERN = re.compile(r"^(?P<stem>.+)-(?P<part>\d{5})-of-(?P<count>\d{
 # Leading-metadata probes (one ~64KB range request each) used to group a GGUF
 # repo's quantizations before any full header read.
 MAX_GGUF_PROBES = 64
+# Probes are tiny and almost all latency (the Hub redirects to its CDN), so
+# they get more concurrency than full header reads.
+MAX_GGUF_PROBE_WORKERS = 16
 
 # transformers' naming convention for weightless preprocessing classes
 # (CLIPTokenizer, T5TokenizerFast, AutoProcessor, CLIPImageProcessor, ...).
@@ -111,6 +115,8 @@ _Item = TypeVar("_Item")
 _Result = TypeVar("_Result")
 # (role, repo, its weight files' repo paths, headers already read from that repo)
 _VisionCheck = tuple[HfRequirementRole, str, list[str], dict[str, TensorShapes]]
+# (role, architecture, confidence, has vision weights) for one identified weight file or group.
+_Identification = tuple[str, str | None, str, bool | None]
 
 load_dotenv()
 
@@ -181,14 +187,18 @@ class HuggingFaceService:
         )
         return HfModel.model_validate(model_data)
 
-    def get_pipeline_requirements(self, model_id: str, include_config: bool = True) -> HfPipelineInfo:
+    def get_pipeline_requirements(
+        self, model_id: str, include_config: bool = True, info: Any = None
+    ) -> HfPipelineInfo:
         """Parse a diffusers `model_index.json` (or a modular pipeline's
         `modular_model_index.json`) and match each declared component against
         the files actually present, so callers can see what a pipeline needs
-        (text encoder, VAE, scheduler, ...) and whether it's there."""
-        index = self._download_pipeline_index(model_id)
+        (text encoder, VAE, scheduler, ...) and whether it's there. `info` is
+        the repo's `model_info(files_metadata=True)`, if the caller has it."""
+        if info is None:
+            info = self.api.model_info(model_id, files_metadata=True)
+        index = self._download_pipeline_index(model_id, info)
 
-        info = self.api.model_info(model_id, files_metadata=True)
         resolved_id = getattr(info, "id", None) or getattr(info, "modelId", model_id)
         own_repo_ids = {model_id.lower(), resolved_id.lower()}
         sizes_by_repo: dict[str, dict[str, int | None]] = {resolved_id: self._sibling_sizes(info)}
@@ -267,8 +277,13 @@ class HuggingFaceService:
             extra_config=extra_config,
         )
 
-    def _download_pipeline_index(self, model_id: str) -> dict[str, Any]:
+    def _download_pipeline_index(self, model_id: str, info: Any) -> dict[str, Any]:
+        # The file listing says up front whether there's an index at all, which
+        # spares two 404 round trips for every repo that isn't a pipeline.
+        listed = {sibling.rfilename for sibling in (getattr(info, "siblings", None) or [])}
         for filename in PIPELINE_INDEX_FILENAMES:
+            if listed and filename not in listed:
+                continue
             try:
                 index_path = hf_hub_download(repo_id=model_id, filename=filename, token=self.token)
             except EntryNotFoundError:
@@ -358,8 +373,9 @@ class HuggingFaceService:
         ancestry, then the per-subfolder configs of a diffusers-layout repo, then
         weight tensor-name fingerprinting plus a small curated table of known
         pipeline families."""
+        info = self.api.model_info(model_id, files_metadata=True)
         try:
-            pipeline = self.get_pipeline_requirements(model_id, include_config=False)
+            pipeline = self.get_pipeline_requirements(model_id, include_config=False, info=info)
             return self._requirements_from_direct_pipeline(pipeline)
         except ModelIndexNotFoundError:
             pass
@@ -378,7 +394,6 @@ class HuggingFaceService:
                 ],
             )
 
-        info = self.api.model_info(model_id, files_metadata=True)
         target_filenames = [sibling.rfilename for sibling in (getattr(info, "siblings", None) or [])]
         notes: list[str] = []
 
@@ -608,7 +623,8 @@ class HuggingFaceService:
                 visited.add(candidate)
 
                 try:
-                    pipeline = self.get_pipeline_requirements(candidate, include_config=False)
+                    candidate_info = self.api.model_info(candidate, files_metadata=True)
+                    pipeline = self.get_pipeline_requirements(candidate, include_config=False, info=candidate_info)
                     return pipeline, candidate, notes
                 except ModelIndexNotFoundError:
                     pass
@@ -628,11 +644,7 @@ class HuggingFaceService:
                         notes.append(f"base model {candidate} could not be fetched ({status or 'error'})")
                     continue
 
-                try:
-                    candidate_info = self.api.model_info(candidate, files_metadata=False)
-                    next_frontier.extend(self._extract_base_model_ids(candidate_info))
-                except HfHubHTTPError:
-                    pass
+                next_frontier.extend(self._extract_base_model_ids(candidate_info))
             frontier = next_frontier
 
         return None, None, notes
@@ -1008,10 +1020,12 @@ class HuggingFaceService:
         }
 
     @staticmethod
-    def _run_parallel(function: Callable[[_Item], _Result], items: list[_Item]) -> list[_Result]:
+    def _run_parallel(
+        function: Callable[[_Item], _Result], items: list[_Item], max_workers: int = MAX_HEADER_READ_WORKERS
+    ) -> list[_Result]:
         if len(items) <= 1:
             return [function(item) for item in items]
-        with ThreadPoolExecutor(max_workers=min(MAX_HEADER_READ_WORKERS, len(items))) as executor:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(items))) as executor:
             return list(executor.map(function, items))
 
     def _requirements_from_fingerprint(
@@ -1038,17 +1052,18 @@ class HuggingFaceService:
             name for name in target_filenames if self._extension(name) in WEIGHT_FORMATS_BY_EXTENSION
         ]
 
-        # Each unit is (files, tensor names), identified as a whole: a sharded
+        # Each unit is (files, identification), identified as a whole: a sharded
         # checkpoint by its index's full tensor list - a VL model's vision tower
-        # usually sits in its last shard - and any other file by its own header.
-        units: list[tuple[list[str], list[str]]] = []
+        # usually sits in its last shard - a group of GGUF variants by its
+        # metadata or one member's header, and any other file by its own header.
+        units: list[tuple[list[str], _Identification | None]] = []
         sharded: set[str] = set()
         if fingerprint:
             index_files = [name for name in target_filenames if name.endswith(SHARD_INDEX_SUFFIX)]
             for index_file, weight_map in self._read_weight_maps(model_id, index_files, notes).items():
                 shards = sorted(set(weight_map.values()))
                 sharded.update(shards)
-                units.append(([index_file, *shards], list(weight_map)))
+                units.append(([index_file, *shards], self._identify_tensors(list(weight_map))))
 
         fingerprint_candidates = (
             [
@@ -1060,31 +1075,31 @@ class HuggingFaceService:
             else []
         )
         fingerprint_candidates.sort(key=lambda name: not self._has_vision_hint(name))
-        variants = self._group_gguf_variants(model_id, fingerprint_candidates)
+        variants, from_metadata = self._group_gguf_variants(model_id, fingerprint_candidates)
+        units.extend(
+            ([filename, *variants.get(filename, [])], identification)
+            for filename, identification in from_metadata.items()
+        )
         grouped = {name for members in variants.values() for name in members}
-        fingerprint_candidates = [name for name in fingerprint_candidates if name not in grouped]
+        fingerprint_candidates = [
+            name for name in fingerprint_candidates if name not in grouped and name not in from_metadata
+        ]
 
         resolved: set[str] = set()
         to_read = fingerprint_candidates[:max_fingerprint_files]
         headers = self._read_headers(model_id, to_read, notes)
         units.extend(
-            ([filename, *variants.get(filename, [])], list(headers[filename]))
+            ([filename, *variants.get(filename, [])], self._identify_tensors(list(headers[filename])))
             for filename in to_read
             if filename in headers
         )
-        for files, tensor_keys in units:
-            identified = identify_by_tensor_names(tensor_keys)
-            if identified is None:
+        for files, identification in units:
+            if identification is None:
                 continue
-            role_name, architecture, confidence = identified
+            role_name, architecture, confidence, has_vision = identification
             resolved.update(files)
             if family is not None and self._family_has_architecture(family, architecture):
                 family_confirmed = True
-            has_vision = (
-                has_vision_tensors(tensor_keys)
-                if role_name == "vision_encoder" or self._is_text_encoder_role(role_name)
-                else None
-            )
 
             existing = self._find_same_model_role(found, role_name, architecture)
             if existing is not None:
@@ -1230,14 +1245,18 @@ class HuggingFaceService:
         existing = found.get(role_name)
         return existing if existing is not None and existing.architecture is None else None
 
-    def _group_gguf_variants(self, repo_id: str, candidates: list[str]) -> dict[str, list[str]]:
+    def _group_gguf_variants(
+        self, repo_id: str, candidates: list[str]
+    ) -> tuple[dict[str, list[str]], dict[str, _Identification]]:
         """GGUF repos ship one model in many quantizations, and an LLM GGUF's
         header embeds its tokenizer (megabytes), so reading every file's tensor
         table isn't viable. Instead each file's leading metadata is probed and
         files with the same architecture and width are taken to be one model,
-        with only the first (in `candidates` order) left to be read. Later
-        shards of a split GGUF have no metadata of their own and join their
-        first shard by name. Returns representative -> the files it stands for."""
+        represented by the first of them (in `candidates` order). Later shards
+        of a split GGUF have no metadata of their own and join their first shard
+        by name. Returns (representative -> the files it stands for,
+        representative -> identification for groups the metadata alone
+        identifies, which then need no header read at all)."""
         variants: dict[str, list[str]] = {}
         first_shards: dict[tuple[str, str], str] = {}
         to_probe: list[str] = []
@@ -1256,27 +1275,44 @@ class HuggingFaceService:
                 variants[name] = []
                 to_probe.append(name)
 
-        def probe(name: str) -> tuple[str, Any] | None:
+        def probe(name: str) -> dict[str, Any] | None:
             try:
-                metadata = read_gguf_metadata(self.token, repo_id, name)
+                return read_gguf_metadata(self.token, repo_id, name)
             except (HfHubHTTPError, OSError, ValueError):
                 return None
-            architecture = metadata.get("general.architecture")
-            if not isinstance(architecture, str):
-                return None
-            return architecture, metadata.get(f"{architecture}.embedding_length")
 
         to_probe = to_probe[:MAX_GGUF_PROBES]
         representatives: dict[tuple[str, Any], str] = {}
-        for name, signature in zip(to_probe, self._run_parallel(probe, to_probe)):
-            if signature is None:
+        from_metadata: dict[str, _Identification] = {}
+        probed = self._run_parallel(probe, to_probe, MAX_GGUF_PROBE_WORKERS)
+        for name, metadata in zip(to_probe, probed):
+            architecture = metadata.get("general.architecture") if metadata else None
+            if not isinstance(architecture, str):
                 continue
-            if signature not in representatives:
-                representatives[signature] = name
+            signature = (architecture, metadata.get(f"{architecture}.embedding_length"))
+            if signature in representatives:
+                representative = representatives[signature]
+                variants.setdefault(representative, []).extend([name, *variants.pop(name, [])])
                 continue
-            representative = representatives[signature]
-            variants.setdefault(representative, []).extend([name, *variants.pop(name, [])])
-        return {name: members for name, members in variants.items() if members}
+            representatives[signature] = name
+            identified = identify_by_gguf_metadata(metadata)
+            if identified is not None:
+                role_name, has_vision = identified
+                from_metadata[name] = (role_name, None, "high", has_vision)
+        return {name: members for name, members in variants.items() if members}, from_metadata
+
+    @classmethod
+    def _identify_tensors(cls, tensor_keys: list[str]) -> _Identification | None:
+        identified = identify_by_tensor_names(tensor_keys)
+        if identified is None:
+            return None
+        role_name, architecture, confidence = identified
+        has_vision = (
+            has_vision_tensors(tensor_keys)
+            if role_name == "vision_encoder" or cls._is_text_encoder_role(role_name)
+            else None
+        )
+        return role_name, architecture, confidence, has_vision
 
     @staticmethod
     def _is_text_encoder_role(role_name: str) -> bool:

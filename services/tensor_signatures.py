@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,14 @@ SIGNATURES: tuple[TensorSignature, ...] = (
         ("text_model.encoder.layers.", "text_model.embeddings.token_embedding"),
     ),
     TensorSignature("audio_codec", None, ("quantizer.vq", "codebook"), confidence="low"),
+    # llama.cpp names a T5 encoder's layers `enc.blk.`, which the LLM GGUF
+    # signature below would otherwise claim.
+    TensorSignature(
+        "text_encoder",
+        "T5EncoderModel",
+        ("enc.blk.", "token_embd."),
+        excluded_substrings=("dec.blk.",),
+    ),
     # Decoder-only LLMs (as models in their own right, or as a pipeline's text
     # encoder): llama.cpp's GGUF naming, then transformers'. Last, since the
     # encoder signatures above are stricter.
@@ -91,6 +100,32 @@ def _is_vision_only(tensor_keys: list[str]) -> bool:
     keys = _weight_keys(tensor_keys)
     hits = sum(1 for key in keys if _is_vision_key(key))
     return hits >= MIN_VISION_TENSORS and hits / len(keys) >= VISION_ONLY_SHARE
+
+
+# GGUF architectures that carry a tokenizer but aren't decoder LLMs; their
+# tensor names still need reading to say what they are.
+GGUF_ENCODER_ARCHITECTURES = frozenset({"t5", "t5encoder", "bert", "nomic-bert", "jina-bert-v2", "modern-bert"})
+
+
+def identify_by_gguf_metadata(metadata: dict[str, Any]) -> tuple[str, bool] | None:
+    """(role, has vision weights) from a GGUF's leading metadata alone, when
+    that's decisive - which spares reading an LLM's multi-MB header (its
+    tokenizer comes before the tensor table). llama.cpp always splits a VL
+    model's vision tower into a separate `clip` mmproj, so an LLM GGUF never
+    has vision weights of its own."""
+    architecture = metadata.get("general.architecture")
+    if architecture == "clip":
+        # Omni models' projectors may be audio-only.
+        if metadata.get("clip.has_vision_encoder") is False:
+            return None
+        return "vision_encoder", True
+    if (
+        isinstance(architecture, str)
+        and architecture not in GGUF_ENCODER_ARCHITECTURES
+        and "tokenizer.ggml.model" in metadata
+    ):
+        return "language_model", False
+    return None
 
 
 def identify_by_tensor_names(tensor_keys: list[str]) -> tuple[str, str | None, str] | None:
