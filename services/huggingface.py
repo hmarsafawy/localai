@@ -31,6 +31,7 @@ from services.pipeline_registry import (
 from services.tensor_signatures import (
     HIGH_CONFIDENCE_COVERAGE,
     ReferenceMatch,
+    has_vision_tensors,
     identify_by_tensor_names,
     is_lora,
     match_reference,
@@ -60,6 +61,17 @@ WEIGHT_FORMATS_BY_EXTENSION = {
 # Tensor-name fingerprinting reads a remote file's header (a range request, not
 # a full download) - only these formats expose tensor names that cheaply.
 FINGERPRINT_EXTENSIONS = (".safetensors", ".gguf")
+SHARD_INDEX_SUFFIX = ".safetensors.index.json"
+
+# llama.cpp's name for a multimodal projector file - distinctive enough to
+# identify one by name when its header isn't read. The broader hints only move
+# a file to the front of the header-read queue, so a repo with a dozen LLM
+# quantizations doesn't spend the whole budget before reaching its mmproj.
+MMPROJ_FILENAME_HINT = "mmproj"
+VISION_FILENAME_HINTS = (MMPROJ_FILENAME_HINT, "vision", "visual", "projector", "siglip")
+# Roles a fingerprinted LLM is a text encoder for rather than a model in its own right.
+DIFFUSION_ROLES = ("transformer", "unet", "vae")
+MAX_VISION_CONFIG_REPOS = 2
 
 # transformers' naming convention for weightless preprocessing classes
 # (CLIPTokenizer, T5TokenizerFast, AutoProcessor, CLIPImageProcessor, ...).
@@ -90,6 +102,8 @@ MAX_BUNDLE_PREFIX_DEPTH = 3
 
 _Item = TypeVar("_Item")
 _Result = TypeVar("_Result")
+# (role, repo, its weight files' repo paths, headers already read from that repo)
+_VisionCheck = tuple[HfRequirementRole, str, list[str], dict[str, TensorShapes]]
 
 load_dotenv()
 
@@ -210,7 +224,7 @@ class HuggingFaceService:
                     pipeline_file
                     for pipeline_file in files
                     if self._extension(pipeline_file.filename) not in WEIGHT_FORMATS_BY_EXTENSION
-                    and not pipeline_file.filename.endswith(".safetensors.index.json")
+                    and not pipeline_file.filename.endswith(SHARD_INDEX_SUFFIX)
                 ]
             external_repo = source_repo if source_repo not in (None, resolved_id) else None
 
@@ -391,43 +405,49 @@ class HuggingFaceService:
     ) -> HfModelRequirements:
         family = match_family_by_class(pipeline.class_name)
         roles: list[HfRequirementRole] = []
+        vision_checks: list[_VisionCheck] = []
         for component in pipeline.components:
             files = [pipeline_file.filename for pipeline_file in component.files]
+            repo_paths = [self._repo_path(component.subfolder, name) for name in files]
             if component.repo_id is not None:
-                roles.append(
-                    HfRequirementRole(
-                        role=component.name,
-                        architecture=component.class_name,
-                        required=component.required,
-                        present=False,
-                        source="external",
-                        sources=[
-                            HfSuggestedSource(
-                                repo_id=component.repo_id,
-                                files=[self._repo_path(component.subfolder, name) for name in files],
-                                note="the pipeline index loads this component from another repo",
-                            )
-                        ],
-                    )
+                role = HfRequirementRole(
+                    role=component.name,
+                    architecture=component.class_name,
+                    required=component.required,
+                    present=False,
+                    source="external",
+                    sources=[
+                        HfSuggestedSource(
+                            repo_id=component.repo_id,
+                            files=repo_paths,
+                            note="the pipeline index loads this component from another repo",
+                        )
+                    ],
                 )
+                roles.append(role)
+                if self._is_text_encoder_role(component.name) and files:
+                    vision_checks.append((role, component.repo_id, repo_paths, {}))
                 continue
 
             present = bool(files)
             sources: list[HfSuggestedSource] = []
             if component.required and not present:
                 sources = self._registry_sources_for_role(family, component.name)
-            roles.append(
-                HfRequirementRole(
-                    role=component.name,
-                    architecture=component.class_name,
-                    required=component.required,
-                    present=present,
-                    source="repo",
-                    subfolder=component.subfolder or None,
-                    files=files,
-                    sources=sources,
-                )
+            role = HfRequirementRole(
+                role=component.name,
+                architecture=component.class_name,
+                required=component.required,
+                present=present,
+                source="repo",
+                subfolder=component.subfolder or None,
+                files=files,
+                sources=sources,
             )
+            roles.append(role)
+            if self._is_text_encoder_role(component.name) and present:
+                vision_checks.append((role, pipeline.model_id, repo_paths, {}))
+
+        self._mark_vision_weights(vision_checks)
         return HfModelRequirements(
             model_id=pipeline.model_id,
             family=family.name if family else None,
@@ -660,6 +680,7 @@ class HuggingFaceService:
         matched: dict[str, list[tuple[str, ReferenceMatch]]] = {}
         lora_files: list[str] = []
         unidentified: list[str] = []
+        headers: dict[str, TensorShapes] = {}
         if fingerprint:
             candidates = [
                 name
@@ -667,7 +688,7 @@ class HuggingFaceService:
                 if name not in in_component_folders and self._extension(name) in FINGERPRINT_EXTENSIONS
             ]
             if candidates:
-                matched, lora_files, unidentified = self._match_files_to_components(
+                matched, lora_files, unidentified, headers = self._match_files_to_components(
                     model_id, pipeline, reference_repo, candidates, notes
                 )
                 unidentified = [name for name in unidentified if name not in claimed]
@@ -687,6 +708,7 @@ class HuggingFaceService:
                     f"{filename} bundles several components in one file ({', '.join(component_names)})"
                 )
 
+        vision_checks: list[_VisionCheck] = []
         for component in pipeline.components:
             own_files = own_files_by_component[component.name]
             fingerprinted = [
@@ -700,18 +722,19 @@ class HuggingFaceService:
                 confidence = "high"
                 if not own_files and all(match.confidence == "low" for _, match in fingerprinted):
                     confidence = "low"
-                roles.append(
-                    HfRequirementRole(
-                        role=component.name,
-                        architecture=component.class_name,
-                        required=component.required,
-                        present=True,
-                        source="repo" if own_files else "fingerprint",
-                        confidence=confidence,
-                        subfolder=component.name if only_subfolder else None,
-                        files=[name[len(prefix) :] for name in files] if only_subfolder else files,
-                    )
+                role = HfRequirementRole(
+                    role=component.name,
+                    architecture=component.class_name,
+                    required=component.required,
+                    present=True,
+                    source="repo" if own_files else "fingerprint",
+                    confidence=confidence,
+                    subfolder=component.name if only_subfolder else None,
+                    files=[name[len(prefix) :] for name in files] if only_subfolder else files,
                 )
+                roles.append(role)
+                if self._is_text_encoder_role(component.name):
+                    vision_checks.append((role, model_id, files, headers))
                 full_copies = [
                     filename
                     for filename, match in fingerprinted
@@ -749,19 +772,23 @@ class HuggingFaceService:
                 )
             sources.extend(self._registry_sources_for_role(family, component.name))
 
-            roles.append(
-                HfRequirementRole(
-                    role=component.name,
-                    architecture=component.class_name,
-                    required=component.required,
-                    present=False,
-                    source=(
-                        "external" if component.repo_id else "base_model" if component.files else "registry"
-                    ),
-                    files=[],
-                    sources=sources,
-                )
+            role = HfRequirementRole(
+                role=component.name,
+                architecture=component.class_name,
+                required=component.required,
+                present=False,
+                source=(
+                    "external" if component.repo_id else "base_model" if component.files else "registry"
+                ),
+                files=[],
+                sources=sources,
             )
+            roles.append(role)
+            if self._is_text_encoder_role(component.name) and component.files:
+                # Describes the copy the first suggested source would bring in.
+                vision_checks.append((role, component.repo_id or reference_repo, sources[0].files, {}))
+
+        self._mark_vision_weights(vision_checks)
 
         if lora_files:
             roles.append(
@@ -792,13 +819,14 @@ class HuggingFaceService:
         reference_repo: str,
         candidates: list[str],
         notes: list[str],
-    ) -> tuple[dict[str, list[tuple[str, ReferenceMatch]]], list[str], list[str]]:
+    ) -> tuple[dict[str, list[tuple[str, ReferenceMatch]]], list[str], list[str], dict[str, TensorShapes]]:
         """Attribute each candidate weight file in `model_id` to whichever of the
         reference pipeline's components it matches best by tensor names/shapes.
-        Returns (component name -> [(file, match)], LoRA files, unmatched files)."""
+        Returns (component name -> [(file, match)], LoRA files, unmatched files,
+        the headers read)."""
         references = self._component_references(reference_repo, pipeline, notes)
         if not references:
-            return {}, [], list(candidates)
+            return {}, [], list(candidates), {}
 
         to_read = candidates[:MAX_REPO_MATCH_FILES]
         unidentified = list(candidates[MAX_REPO_MATCH_FILES:])
@@ -865,7 +893,7 @@ class HuggingFaceService:
                 )
             )
 
-        return matched, lora_files, unidentified
+        return matched, lora_files, unidentified, headers
 
     @classmethod
     def _match_tensor_groups(
@@ -1002,30 +1030,53 @@ class HuggingFaceService:
         weight_files = [
             name for name in target_filenames if self._extension(name) in WEIGHT_FORMATS_BY_EXTENSION
         ]
+
+        # Each unit is (files, tensor names), identified as a whole: a sharded
+        # checkpoint by its index's full tensor list - a VL model's vision tower
+        # usually sits in its last shard - and any other file by its own header.
+        units: list[tuple[list[str], list[str]]] = []
+        sharded: set[str] = set()
+        if fingerprint:
+            index_files = [name for name in target_filenames if name.endswith(SHARD_INDEX_SUFFIX)]
+            for index_file, weight_map in self._read_weight_maps(model_id, index_files, notes).items():
+                shards = sorted(set(weight_map.values()))
+                sharded.update(shards)
+                units.append(([index_file, *shards], list(weight_map)))
+
         fingerprint_candidates = (
-            [name for name in weight_files if self._extension(name) in FINGERPRINT_EXTENSIONS]
+            [
+                name
+                for name in weight_files
+                if self._extension(name) in FINGERPRINT_EXTENSIONS and name not in sharded
+            ]
             if fingerprint
             else []
         )
+        fingerprint_candidates.sort(key=lambda name: not self._has_vision_hint(name))
 
         resolved: set[str] = set()
         to_read = fingerprint_candidates[:max_fingerprint_files]
         headers = self._read_headers(model_id, to_read, notes)
-        for filename in to_read:
-            if filename not in headers:
-                continue
-
-            identified = identify_by_tensor_names(list(headers[filename]))
+        units.extend(([filename], list(headers[filename])) for filename in to_read if filename in headers)
+        for files, tensor_keys in units:
+            identified = identify_by_tensor_names(tensor_keys)
             if identified is None:
                 continue
             role_name, architecture, confidence = identified
-            resolved.add(filename)
+            resolved.update(files)
             if family is not None and self._family_has_architecture(family, architecture):
                 family_confirmed = True
+            has_vision = (
+                has_vision_tensors(tensor_keys)
+                if role_name == "vision_encoder" or self._is_text_encoder_role(role_name)
+                else None
+            )
 
-            existing = self._find_role_with_architecture(found, architecture)
+            existing = self._find_same_model_role(found, role_name, architecture)
             if existing is not None:
-                existing.files.append(filename)
+                existing.files.extend(files)
+                if has_vision is not None:
+                    existing.has_vision_weights = bool(existing.has_vision_weights) or has_vision
                 continue
 
             role_name = self._next_available_role_name(role_name, found)
@@ -1036,11 +1087,40 @@ class HuggingFaceService:
                 present=True,
                 source="fingerprint",
                 confidence=confidence,
-                files=[filename],
+                files=list(files),
+                has_vision_weights=has_vision,
             )
+
+        if any(name in found for name in DIFFUSION_ROLES):
+            # An LLM next to a diffusion model is that model's text encoder
+            # (Qwen-Image's Qwen2.5-VL, Z-Image's Qwen3, ...).
+            for name in [name for name in found if name.startswith("language_model")]:
+                role = found.pop(name)
+                role.role = self._next_available_role_name("text_encoder", found)
+                found[role.role] = role
+        is_language_model = any(name.startswith("language_model") for name in found)
 
         for filename in weight_files:
             if filename in resolved:
+                continue
+
+            # An mmproj whose header wasn't read (or didn't look vision-only,
+            # e.g. an omni model's combined vision+audio projector) still
+            # names itself; one that was read must actually carry vision weights.
+            if MMPROJ_FILENAME_HINT in filename.rsplit("/", 1)[-1].lower() and (
+                filename not in headers or has_vision_tensors(list(headers[filename]))
+            ):
+                existing = found.get("vision_encoder")
+                if existing is not None:
+                    existing.files.append(filename)
+                else:
+                    found["vision_encoder"] = HfRequirementRole(
+                        role="vision_encoder",
+                        present=True,
+                        source="repo",
+                        files=[filename],
+                        has_vision_weights=True,
+                    )
                 continue
 
             discovered = match_filename_alias(filename)
@@ -1091,6 +1171,20 @@ class HuggingFaceService:
                     "generation of the model"
                 )
 
+        if is_language_model:
+            # An LLM runs text-only without its vision encoder; it's only
+            # needed for image input.
+            for name, role in found.items():
+                if name.startswith("vision_encoder"):
+                    role.required = False
+            if not any(role.has_vision_weights for role in found.values()):
+                declared_by = self._vision_config_source(model_id, info, target_filenames)
+                if declared_by is not None:
+                    notes.append(
+                        f"{declared_by}'s config declares a vision encoder, but no vision weights were found "
+                        "in this repo - image input needs a matching mmproj/vision encoder from elsewhere"
+                    )
+
         return HfModelRequirements(
             model_id=getattr(info, "id", None) or model_id,
             family=family.name if family else None,
@@ -1111,12 +1205,95 @@ class HuggingFaceService:
         return f"{base_name}_{index}"
 
     @staticmethod
-    def _find_role_with_architecture(
-        found: dict[str, HfRequirementRole], architecture: str | None
+    def _find_same_model_role(
+        found: dict[str, HfRequirementRole], role_name: str, architecture: str | None
     ) -> HfRequirementRole | None:
-        if architecture is None:
+        """The role an identified file joins: the one with its architecture or,
+        when the signature names none, the same-named role that doesn't either -
+        so a repo's quantizations of one LLM (or its mmproj) group together."""
+        if architecture is not None:
+            return next((role for role in found.values() if role.architecture == architecture), None)
+        existing = found.get(role_name)
+        return existing if existing is not None and existing.architecture is None else None
+
+    @staticmethod
+    def _is_text_encoder_role(role_name: str) -> bool:
+        return role_name.startswith(("text_encoder", "language_model"))
+
+    @staticmethod
+    def _has_vision_hint(filename: str) -> bool:
+        basename = filename.rsplit("/", 1)[-1].lower()
+        return any(hint in basename for hint in VISION_FILENAME_HINTS)
+
+    def _weight_map(self, repo_id: str, index_file: str) -> dict[str, str]:
+        """Tensor name -> shard (full repo path), from a sharded checkpoint's index."""
+        index_path = hf_hub_download(repo_id=repo_id, filename=index_file, token=self.token)
+        with open(index_path, encoding="utf-8") as file:
+            index = json.load(file)
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(weight_map, dict):
+            raise ValueError("index has no weight_map")
+        folder = index_file.rpartition("/")[0]
+        return {name: self._repo_path(folder, shard) for name, shard in weight_map.items()}
+
+    def _read_weight_maps(
+        self, repo_id: str, index_files: list[str], notes: list[str]
+    ) -> dict[str, dict[str, str]]:
+        def read(index_file: str) -> dict[str, str] | None:
+            try:
+                return self._weight_map(repo_id, index_file)
+            except (HfHubHTTPError, OSError, ValueError) as error:
+                notes.append(f"could not read shard index {index_file} ({error})")
+                return None
+
+        return {
+            index_file: weight_map
+            for index_file, weight_map in zip(index_files, self._run_parallel(read, index_files))
+            if weight_map
+        }
+
+    def _has_vision_weights(
+        self, repo_id: str, paths: list[str], headers: dict[str, TensorShapes]
+    ) -> bool | None:
+        """Whether a component's weight files (full repo paths) include a
+        vision encoder. Uses headers already read, the shard index when there
+        is one (the vision tower is often only in the last shard), and
+        otherwise reads one weight file's header. None if nothing was readable."""
+        key_sets = [list(headers[path]) for path in paths if path in headers]
+        index_file = next((path for path in paths if path.endswith(SHARD_INDEX_SUFFIX)), None)
+        weight_file = next((path for path in paths if self._extension(path) in FINGERPRINT_EXTENSIONS), None)
+        try:
+            if index_file is not None:
+                key_sets.append(list(self._weight_map(repo_id, index_file)))
+            elif not key_sets and weight_file is not None:
+                key_sets.append(list(read_tensor_shapes(self.api, self.token, repo_id, weight_file)))
+        except (HfHubHTTPError, OSError, ValueError):
+            pass
+        if not key_sets:
             return None
-        return next((role for role in found.values() if role.architecture == architecture), None)
+        return any(has_vision_tensors(keys) for keys in key_sets)
+
+    def _mark_vision_weights(self, checks: list[_VisionCheck]) -> None:
+        results = self._run_parallel(lambda check: self._has_vision_weights(*check[1:]), checks)
+        for (role, _, _, _), has_vision in zip(checks, results):
+            role.has_vision_weights = has_vision
+
+    def _vision_config_source(self, model_id: str, info: Any, target_filenames: list[str]) -> str | None:
+        """The repo itself or one of its base models whose config.json declares
+        a `vision_config` (transformers' marker of a VL model), if any."""
+        candidates = ([model_id] if "config.json" in target_filenames else []) + self._extract_base_model_ids(
+            info
+        )[:MAX_VISION_CONFIG_REPOS]
+        for repo_id in candidates:
+            try:
+                config_path = hf_hub_download(repo_id=repo_id, filename="config.json", token=self.token)
+                with open(config_path, encoding="utf-8") as file:
+                    config = json.load(file)
+            except (HfHubHTTPError, OSError, ValueError):
+                continue
+            if isinstance(config, dict) and isinstance(config.get("vision_config"), dict):
+                return repo_id
+        return None
 
     @staticmethod
     def _family_has_architecture(family: FamilyDef, architecture: str | None) -> bool:

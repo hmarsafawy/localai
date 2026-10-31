@@ -45,13 +45,62 @@ SIGNATURES: tuple[TensorSignature, ...] = (
         ("text_model.encoder.layers.", "text_model.embeddings.token_embedding"),
     ),
     TensorSignature("audio_codec", None, ("quantizer.vq", "codebook"), confidence="low"),
+    # Decoder-only LLMs (as models in their own right, or as a pipeline's text
+    # encoder): llama.cpp's GGUF naming, then transformers'. Last, since the
+    # encoder signatures above are stricter.
+    TensorSignature("language_model", None, ("token_embd.", "blk.")),
+    TensorSignature("language_model", None, ("embed_tokens.", ".layers.")),
 )
+
+# Dotted segments multimodal checkpoints keep their vision tower and projector
+# under: Qwen-VL `visual.`, LLaVA/Gemma3/Mistral3 `vision_tower.` +
+# `multi_modal_projector.`, Idefics/Mllama/CLIP `vision_model.`, Pixtral
+# `vision_encoder.`, Phi-3-vision `vision_embed_tokens.`, MiniCPM-V `vpm.`.
+VISION_SEGMENTS = frozenset(
+    {
+        "visual",
+        "vision_tower",
+        "vision_model",
+        "vision_encoder",
+        "vision_embed_tokens",
+        "multi_modal_projector",
+        "mm_projector",
+        "vpm",
+    }
+)
+# llama.cpp mmproj files: `v.blk.N.`, `v.patch_embd`, ... plus `mm.N.` for the projector.
+GGUF_VISION_PREFIXES = ("v.", "mm.")
+# A real vision tower is hundreds of tensors; a few stray matches aren't one.
+MIN_VISION_TENSORS = 8
+VISION_ONLY_SHARE = 0.9
+
+
+def _is_vision_key(key: str) -> bool:
+    return key.startswith(GGUF_VISION_PREFIXES) or any(
+        segment in VISION_SEGMENTS for segment in key.split(".")
+    )
+
+
+def has_vision_tensors(tensor_keys: list[str]) -> bool:
+    """Whether a file (or component) carries vision encoder weights - e.g. a
+    VL model used as a text encoder, or a multimodal LLM checkpoint."""
+    return sum(1 for key in _weight_keys(tensor_keys) if _is_vision_key(key)) >= MIN_VISION_TENSORS
+
+
+def _is_vision_only(tensor_keys: list[str]) -> bool:
+    keys = _weight_keys(tensor_keys)
+    hits = sum(1 for key in keys if _is_vision_key(key))
+    return hits >= MIN_VISION_TENSORS and hits / len(keys) >= VISION_ONLY_SHARE
 
 
 def identify_by_tensor_names(tensor_keys: list[str]) -> tuple[str, str | None, str] | None:
     """Returns (role, architecture, confidence) for the first matching signature, or None."""
     if not tensor_keys:
         return None
+    # A standalone vision encoder (an LLM's mmproj, a CLIP/SigLIP vision
+    # tower) - checked first, since an mmproj's `v.blk.` also contains `blk.`.
+    if _is_vision_only(tensor_keys):
+        return "vision_encoder", None, "high"
     blob = " ".join(tensor_keys)
     for signature in SIGNATURES:
         if any(excluded in blob for excluded in signature.excluded_substrings):

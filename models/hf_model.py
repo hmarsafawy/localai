@@ -114,6 +114,11 @@ class HfRequirementRole(BaseModel):
     subfolder: str | None = None
     files: list[str] = Field(default_factory=list)
     sources: list[HfSuggestedSource] = Field(default_factory=list)
+    # Whether this role's weights include a vision encoder: set for text
+    # encoders/LLMs (a VL model like Qwen2.5-VL keeps its vision tower in the
+    # same checkpoint) and standalone vision encoders (mmproj). None when not
+    # checked or the weights couldn't be read.
+    has_vision_weights: bool | None = None
 
 
 class HfModelRequirements(BaseModel):
