@@ -37,6 +37,7 @@ from services.tensor_signatures import (
     identify_by_tensor_names,
     is_lora,
     match_reference,
+    shapes_agree,
 )
 from services.weight_headers import TensorShapes, read_gguf_metadata, read_tensor_shapes
 
@@ -771,6 +772,18 @@ class HuggingFaceService:
                         "tensor names (renamed, fused or repacked layers) - likely converted copies, e.g. "
                         "ComfyUI/native format, that need a loader for that format: " + ", ".join(converted)
                     )
+                relaid = [
+                    filename
+                    for filename, match in fingerprinted
+                    if match.confidence == "high" and "parameters" in match.method
+                ]
+                if relaid:
+                    notes.append(
+                        f"{component.name}: {len(relaid)} file(s) store {reference_repo}'s {component.name} "
+                        "in a non-diffusers layout (renamed/fused layers, e.g. BFL/ComfyUI-native or a GGUF "
+                        "converted from it; identified by total parameter count) - they need a loader for "
+                        "that format rather than diffusers' from_pretrained: " + ", ".join(relaid)
+                    )
                 continue
 
             sources: list[HfSuggestedSource] = []
@@ -898,6 +911,11 @@ class HuggingFaceService:
                 unidentified.append(filename)
                 continue
             peer_name, peer_match = best
+            if peer_match.method == "names" and not shapes_agree(headers[filename], headers[peer_name]):
+                # Same naming, different model: a variant with a resized
+                # layer (FLUX.1 Fill/Canny next to dev), not a quantization.
+                unidentified.append(filename)
+                continue
             component_name, reference_match = peers[peer_name]
             confident = peer_match.confidence == "high" and reference_match.confidence == "high"
             matched[component_name].append(
@@ -907,7 +925,10 @@ class HuggingFaceService:
                         peer_match.candidate_coverage,
                         min(peer_match.reference_coverage, reference_match.reference_coverage),
                         "high" if confident else "low",
-                        f"{peer_match.method} via {peer_name}",
+                        # A peer that itself only matched by parameter count
+                        # is in a non-diffusers layout, and so is its sibling.
+                        f"{peer_match.method} via {peer_name}"
+                        + ("" if reference_match.method == "names" else f" ({reference_match.method})"),
                     ),
                 )
             )

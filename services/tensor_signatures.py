@@ -6,6 +6,7 @@ to repos that never declare a `model_index.json` at all.
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
@@ -189,7 +190,7 @@ class ReferenceMatch:
     candidate_coverage: float
     reference_coverage: float
     confidence: str
-    method: str  # "names" | "shapes"
+    method: str  # "names" | "shapes" | "parameters"
 
     @property
     def score(self) -> float:
@@ -224,6 +225,53 @@ def _coverage(keys: list[str], other_variants: set[str]) -> float:
     return hits / len(keys)
 
 
+def _packed_stems(tensor_keys: list[str]) -> set[str]:
+    """Names a quantizer's side tensors hang off: the module (comfy
+    `x.weight_scale`, MLX `x.scales`) or the weight itself (bitsandbytes
+    `x.weight.absmax`). The weights under them may be stored packed."""
+    stems: set[str] = set()
+    for key in tensor_keys:
+        suffix = next((suffix for suffix in QUANT_AUX_SUFFIXES if key.endswith(suffix)), None)
+        if suffix is not None:
+            stems.add(key[: -len(suffix)])
+            continue
+        for marker in QUANT_AUX_MARKERS:
+            if marker in key:
+                stems.add(key.split(marker, 1)[0])
+    return stems
+
+
+def shapes_agree(candidate: dict[str, tuple[int, ...]], peer: dict[str, tuple[int, ...]]) -> bool:
+    """Whether a file that shares a peer's tensor names also has its shapes,
+    apart from weights a quantizer packed (which have side tensors). A
+    quantized sibling passes; a same-family variant with a resized layer - a
+    FLUX.1 Fill/Canny checkpoint next to dev, named identically - doesn't."""
+    peer_shapes: dict[str, tuple[int, ...]] = {}
+    for key in _weight_keys(list(peer)):
+        for variant in _suffix_variants(key):
+            peer_shapes.setdefault(variant, peer[key])
+    candidate_packed = _packed_stems(list(candidate))
+    peer_packed = _packed_stems(list(peer))
+    for key in _weight_keys(list(candidate)):
+        module = key.rsplit(".", 1)[0]
+        if {key, module} & (candidate_packed | peer_packed):
+            continue
+        shape = next((peer_shapes[variant] for variant in _suffix_variants(key) if variant in peer_shapes), None)
+        if shape is not None and shape != candidate[key]:
+            return False
+    return True
+
+
+def _matrix_parameter_count(shapes: dict[str, tuple[int, ...]]) -> int:
+    """Parameters held in matrices/conv kernels. Vectors (norm scales, biases,
+    pad tokens, however they're reshaped) are left out: converters routinely
+    add or drop one - ComfyUI's Lumina 2 keeps a `norm_final.weight` diffusers
+    discards - while the weight matrices themselves never change."""
+    return sum(
+        math.prod(shape) for shape in shapes.values() if sum(1 for dim in shape if dim > 1) >= 2
+    )
+
+
 def _shape_overlap(candidate: dict[str, tuple[int, ...]], reference: dict[str, tuple[int, ...]]) -> float:
     # Dims are sorted so a transposed/reshaped-but-equivalent tensor still
     # counts; this is a coarse structural signal, only used when names fail.
@@ -245,8 +293,15 @@ def match_reference(
     quantization side tensors. If names don't line up - e.g. a ComfyUI-format
     VAE vs the diffusers one, which share weights but not a naming scheme -
     falls back to matching tensor count and the multiset of shapes, at low
-    confidence. Quantized files whose shapes change (MLX packing) only match by
-    name."""
+    confidence. Failing that, an identical parameter count across the weight
+    matrices still identifies the component: BFL/ComfyUI-native checkpoints
+    and the GGUFs converted from them fuse q/k/v and rename every layer, which
+    changes the tensor count by a third, but no conversion adds or drops a
+    weight matrix (GGUF records the unquantized dims). Exact equality keeps
+    same-family variants with a resized layer (FLUX.1 Fill/Canny vs dev) from
+    matching.
+    Quantized files whose shapes change (MLX, nvfp4 or SVDQuant packing) only
+    match by name."""
     candidate_keys = _weight_keys(list(candidate))
     reference_keys = _weight_keys(reference_keys)
     if not candidate_keys or not reference_keys:
@@ -271,5 +326,8 @@ def match_reference(
             overlap = _shape_overlap(candidate_weights, reference_weights)
             if overlap >= MIN_SHAPE_OVERLAP:
                 return ReferenceMatch(overlap, overlap, "low", "shapes")
+        reference_parameters = _matrix_parameter_count(reference_weights)
+        if reference_parameters and _matrix_parameter_count(candidate_weights) == reference_parameters:
+            return ReferenceMatch(1.0, 1.0, "high", "parameters")
 
     return None
