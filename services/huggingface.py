@@ -22,6 +22,12 @@ from models.hf_model import (
     HfSuggestedSource,
 )
 from schemas.hf_model import HfModelSearchRequest
+from services.model_options import (
+    WEIGHT_FORMATS_BY_EXTENSION,
+    attach_options,
+    quantization_from_file_type,
+    unparsed_gguf_paths,
+)
 from services.pipeline_registry import (
     FamilyDef,
     match_family_by_class,
@@ -47,19 +53,6 @@ MODEL_INDEX_FILENAME = "model_index.json"
 # point outside the component's own folder - or at another repo entirely.
 MODULAR_MODEL_INDEX_FILENAME = "modular_model_index.json"
 PIPELINE_INDEX_FILENAMES = (MODEL_INDEX_FILENAME, MODULAR_MODEL_INDEX_FILENAME)
-
-WEIGHT_FORMATS_BY_EXTENSION = {
-    ".safetensors": "safetensors",
-    ".bin": "pytorch",
-    ".pt": "pytorch",
-    ".pth": "pytorch",
-    ".ckpt": "pytorch",
-    ".msgpack": "flax",
-    ".onnx": "onnx",
-    ".onnx_data": "onnx",
-    ".xml": "openvino",
-    ".gguf": "gguf",
-}
 
 # Tensor-name fingerprinting reads a remote file's header (a range request, not
 # a full download) - only these formats expose tensor names that cheaply.
@@ -373,8 +366,45 @@ class HuggingFaceService:
         single-file checkpoints, ...). Falls back through the repo's `base_model`
         ancestry, then the per-subfolder configs of a diffusers-layout repo, then
         weight tensor-name fingerprinting plus a small curated table of known
-        pipeline families."""
+        pipeline families. Each role also lists the options it can be downloaded
+        as (one per quantization, precision or variant)."""
         info = self.api.model_info(model_id, files_metadata=True)
+        requirements = self._resolve_requirements(
+            model_id, info, resolve_base_model, fingerprint, max_fingerprint_files
+        )
+        attach_options(
+            requirements,
+            self._sibling_sizes(info),
+            self._quantizations_from_metadata(model_id, unparsed_gguf_paths(requirements)),
+        )
+        return requirements
+
+    def _quantizations_from_metadata(self, repo_id: str, filenames: list[str]) -> dict[str, str]:
+        """For GGUFs whose names don't say: what each one's own metadata claims,
+        where a small read can reach it. In an LLM with a big tokenizer the key is
+        megabytes in (measured: 5 to 85 MB per file, up to a minute), which is too
+        slow for a listing, so those stay labelled by their variant text."""
+
+        def probe(name: str) -> str | None:
+            try:
+                return quantization_from_file_type(
+                    read_gguf_metadata(self.token, repo_id, name).get("general.file_type")
+                )
+            except (HfHubHTTPError, OSError, ValueError):
+                return None
+
+        to_probe = filenames[:MAX_GGUF_PROBES]
+        probed = self._run_parallel(probe, to_probe, MAX_GGUF_PROBE_WORKERS)
+        return {name: quantization for name, quantization in zip(to_probe, probed) if quantization}
+
+    def _resolve_requirements(
+        self,
+        model_id: str,
+        info: Any,
+        resolve_base_model: bool,
+        fingerprint: bool,
+        max_fingerprint_files: int,
+    ) -> HfModelRequirements:
         try:
             pipeline = self.get_pipeline_requirements(model_id, include_config=False, info=info)
             return self._requirements_from_direct_pipeline(pipeline)

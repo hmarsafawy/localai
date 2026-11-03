@@ -4,3 +4,5 @@ huggingface-hub>=0.36,<1.0
 python-dotenv>=1.0,<2.0
 diffusers>=0.35,<0.36
 transformers>=4.57,<5.0
+httpx>=0.28,<1.0
+psutil>=7.0,<8.0

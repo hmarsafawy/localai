@@ -23,8 +23,10 @@ GgufMetadata = dict[str, str | int | float | bool]
 GGUF_MAGIC = b"GGUF"
 GGUF_INITIAL_FETCH_BYTES = 256 * 1024
 GGUF_MAX_FETCH_BYTES = 64 * 1024 * 1024
-# `general.*` and architecture keys come before the tokenizer, so a small
-# prefix holds them even when the full header runs to megabytes.
+# Most `general.*` and architecture keys come before the tokenizer, so a small
+# prefix holds them even when the full header runs to megabytes. The exception
+# is `general.file_type`, which quantizing writes after the tokenizer: this only
+# reaches it in files with no or a small tokenizer (mmproj, MTP heads).
 GGUF_METADATA_FETCH_BYTES = 64 * 1024
 
 # GGUF metadata value types -> struct format. 8 (string) and 9 (array) are

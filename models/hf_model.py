@@ -99,6 +99,27 @@ class HfSuggestedSource(BaseModel):
     note: str | None = None
 
 
+class HfRoleOption(BaseModel):
+    """One choice for a role: a single quantization, precision or variant of its
+    weights, with every file (shards, index, configs) needed to use it."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    label: str
+    quantization: str | None = None
+    # What sets this apart beyond its quantization (`draft`, `noMTP`, ...).
+    variant: str | None = None
+    format: str | None = None
+    # Full repo paths, whatever the role's `subfolder` is.
+    files: list[str] = Field(default_factory=list)
+    shards: int = 1
+    size_bytes: int | None = None
+    estimated_memory_bytes: int | None = None
+    fit: str | None = None  # "fits_gpu" | "partial_gpu" | "cpu_only" | "too_large"
+    recommended: bool = False
+
+
 class HfRequirementRole(BaseModel):
     """One thing a pipeline needs (a text encoder, a VAE, ...), regardless of
     whether the repo itself has a `model_index.json`."""
@@ -119,6 +140,9 @@ class HfRequirementRole(BaseModel):
     # same checkpoint) and standalone vision encoders (mmproj). None when not
     # checked or the weights couldn't be read.
     has_vision_weights: bool | None = None
+    # How `options` may be chosen from: "one" | "optional_one" | "any" | "all".
+    selection: str = "all"
+    options: list[HfRoleOption] = Field(default_factory=list)
 
 
 class HfModelRequirements(BaseModel):

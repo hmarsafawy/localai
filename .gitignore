@@ -221,3 +221,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Installed llama.cpp builds (about 1 GB each)
+/runtimes/
+
+/tests/
+/pytest.ini
+/requirements-dev.txt

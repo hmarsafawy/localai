@@ -10,10 +10,20 @@ from schemas.hf_model import (
     HfPipelineResponse,
     HfRequirementsResponse,
 )
+from services.hardware import hardware_service
 from services.huggingface import HuggingFaceService, ModelIndexNotFoundError
+from services.model_options import annotate_fit
 
 router = APIRouter()
 service = HuggingFaceService()
+
+
+def _requirements_with_fit(
+    model_id: str, resolve_base_model: bool, fingerprint: bool, fit: bool
+) -> HfModelRequirements:
+    requirements = service.get_model_requirements(model_id, resolve_base_model, fingerprint)
+    annotate_fit(requirements, hardware_service.memory_budget() if fit else None)
+    return requirements
 
 
 def _map_hf_error(error: HfHubHTTPError) -> HTTPException:
@@ -47,13 +57,18 @@ async def get_model_requirements(
     model_id: str,
     resolve_base_model: bool = Query(default=True),
     fingerprint: bool = Query(default=True),
+    fit: bool = Query(default=True),
 ) -> HfModelRequirements:
     """What a model needs to run, even without a `model_index.json`: falls back
     through the repo's `base_model` ancestry, weight tensor-name fingerprinting,
-    and a small curated table of known pipeline families (Flux, SDXL, ...)."""
+    and a small curated table of known pipeline families (Flux, SDXL, ...).
+
+    Each role's `options` lists what can be downloaded for it, one per
+    quantization, precision or variant. With `fit`, LLM options are also rated
+    against this machine's free memory and one is marked as recommended."""
     try:
         return await to_thread.run_sync(
-            service.get_model_requirements, model_id, resolve_base_model, fingerprint
+            _requirements_with_fit, model_id, resolve_base_model, fingerprint, fit
         )
     except HfHubHTTPError as error:
         raise _map_hf_error(error) from error
