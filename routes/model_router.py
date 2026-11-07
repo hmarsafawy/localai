@@ -26,7 +26,7 @@ def _requirements_with_fit(
     return requirements
 
 
-def _map_hf_error(error: HfHubHTTPError) -> HTTPException:
+def map_hf_error(error: HfHubHTTPError) -> HTTPException:
     """`HfHubHTTPError` covers everything from a real 404 to a gated repo to a
     rate limit - collapsing all of that into a blanket "not found" is
     misleading, so surface what the Hub actually said instead."""
@@ -71,7 +71,7 @@ async def get_model_requirements(
             _requirements_with_fit, model_id, resolve_base_model, fingerprint, fit
         )
     except HfHubHTTPError as error:
-        raise _map_hf_error(error) from error
+        raise map_hf_error(error) from error
 
 
 @router.get("/{model_id:path}/pipeline", response_model=HfPipelineResponse)
@@ -86,7 +86,7 @@ async def get_model_pipeline(model_id: str, include_config: bool = Query(default
             detail="Repository has no model_index.json or modular_model_index.json (not a diffusers pipeline)",
         ) from error
     except HfHubHTTPError as error:
-        raise _map_hf_error(error) from error
+        raise map_hf_error(error) from error
 
 
 @router.get("/{model_id:path}", response_model=HfModelResponse)
@@ -94,4 +94,4 @@ async def get_model(model_id: str) -> HfModel:
     try:
         return await to_thread.run_sync(service.get_model, model_id)
     except HfHubHTTPError as error:
-        raise _map_hf_error(error) from error
+        raise map_hf_error(error) from error

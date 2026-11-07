@@ -15,6 +15,9 @@ class JobInfo(BaseModel):
     key: str
     status: str = "queued"  # "queued" | "running" | "completed" | "failed" | "cancelled"
     stage: str | None = None
+    # What the job was asked to do, once any defaults are resolved.
+    details: dict[str, Any] = Field(default_factory=dict)
+    current_file: str | None = None
     bytes_done: int = 0
     bytes_total: int | None = None
     speed_bytes_per_second: float | None = None

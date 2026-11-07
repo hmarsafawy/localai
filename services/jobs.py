@@ -92,6 +92,11 @@ class JobContext:
         if self._record.cancel.is_set():
             raise JobCancelled
 
+    def wait(self, seconds: float) -> None:
+        """A pause that a cancel request cuts short."""
+        if self._record.cancel.wait(seconds):
+            raise JobCancelled
+
 
 class JobStore:
     def __init__(self, max_concurrent: int = 2) -> None:
@@ -99,14 +104,22 @@ class JobStore:
         self._jobs: dict[str, _JobRecord] = {}
         self._slots = threading.BoundedSemaphore(max_concurrent)
 
-    def submit(self, kind: str, key: str, work: Callable[[JobContext], dict[str, Any] | None]) -> JobInfo:
+    def submit(
+        self,
+        kind: str,
+        key: str,
+        work: Callable[[JobContext], dict[str, Any] | None],
+        details: dict[str, Any] | None = None,
+    ) -> JobInfo:
         """Starts `work` on a background thread, or returns the job already
         working on `key`. Daemon threads so a download can't block shutdown."""
         with self.lock:
             for record in self._jobs.values():
                 if record.info.key == key and record.info.status in ACTIVE_STATUSES:
                     return record.info.model_copy(deep=True)
-            record = _JobRecord(JobInfo(id=uuid.uuid4().hex, kind=kind, key=key, created_at=_now()))
+            record = _JobRecord(
+                JobInfo(id=uuid.uuid4().hex, kind=kind, key=key, details=details or {}, created_at=_now())
+            )
             self._jobs[record.info.id] = record
             self._prune()
             snapshot = record.info.model_copy(deep=True)
@@ -117,6 +130,11 @@ class JobStore:
         with self.lock:
             record = self._jobs.get(job_id)
             return record.info.model_copy(deep=True) if record else None
+
+    def all_jobs(self) -> list[JobInfo]:
+        """Newest first."""
+        with self.lock:
+            return [record.info.model_copy(deep=True) for record in reversed(self._jobs.values())]
 
     def cancel(self, job_id: str) -> JobInfo | None:
         """Asks a job to stop. It's a request: the job stops at its next check,
@@ -193,35 +211,62 @@ def download_file(
     *,
     sha256: str | None = None,
     base_bytes: int = 0,
+    size: int | None = None,
 ) -> None:
     """Downloads to `destination`, continuing from whatever's already there, and
     checks the whole file against `sha256` when one is given. `base_bytes` is
     what earlier files in the same job transferred, for its overall progress.
-    A cancelled download's partial file is kept so it can resume."""
+    A cancelled download's partial file is kept so it can resume.
+
+    `size`, when known, avoids asking for bytes past the end of a finished file:
+    Hugging Face's CDN answers that with a bare 416, which can't be told apart
+    from a partial of some other version. A file that ends short raises a
+    transport error rather than failing its checksum, so the caller can resume
+    it instead of losing what's there."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     existing = destination.stat().st_size if destination.exists() else 0
-    headers = {"Range": f"bytes={existing}-"} if existing else {}
+    if size is not None and existing > size:
+        destination.unlink()
+        existing = 0
 
-    with client.stream("GET", url, headers=headers, follow_redirects=True, timeout=DOWNLOAD_TIMEOUT) as response:
-        if response.status_code == 416:
-            # Asking past the end is what a finished file looks like. Anything
-            # else means the partial belongs to some other version of the file.
-            if _total_from_content_range(response.headers.get("Content-Range")) != existing:
-                destination.unlink()
-                download_file(client, url, destination, context, sha256=sha256, base_bytes=base_bytes)
-                return
-        else:
-            response.raise_for_status()
-            if response.status_code != 206:
-                existing = 0  # The server ignored the range and sent it all.
-            with open(destination, "ab" if existing else "wb") as output:
-                written = existing
-                context.progress(base_bytes + written)
-                for chunk in response.iter_bytes(DOWNLOAD_CHUNK_BYTES):
-                    context.check_cancelled()
-                    output.write(chunk)
-                    written += len(chunk)
+    if size is None or existing < size:
+        headers = {"Range": f"bytes={existing}-"} if existing else {}
+        with client.stream(
+            "GET", url, headers=headers, follow_redirects=True, timeout=DOWNLOAD_TIMEOUT
+        ) as response:
+            if response.status_code == 416:
+                # Asking past the end is what a finished file looks like. Anything
+                # else means the partial belongs to some other version of the file.
+                if _total_from_content_range(response.headers.get("Content-Range")) != existing:
+                    destination.unlink()
+                    download_file(
+                        client, url, destination, context, sha256=sha256, base_bytes=base_bytes, size=size
+                    )
+                    return
+            else:
+                response.raise_for_status()
+                if response.status_code != 206:
+                    existing = 0  # The server ignored the range and sent it all.
+                with open(destination, "ab" if existing else "wb") as output:
+                    written = existing
                     context.progress(base_bytes + written)
+                    for chunk in response.iter_bytes(DOWNLOAD_CHUNK_BYTES):
+                        context.check_cancelled()
+                        output.write(chunk)
+                        written += len(chunk)
+                        context.progress(base_bytes + written)
+
+    if size is not None:
+        actual = destination.stat().st_size
+        if actual < size:
+            raise httpx.ReadError(f"{destination.name} ended early, at {actual} of {size} bytes")
+        if actual > size:
+            destination.unlink()
+            raise DownloadIntegrityError(
+                f"{destination.name} came to {actual} bytes instead of {size}. "
+                "The file was removed; try again."
+            )
+        context.progress(base_bytes + actual)
 
     if sha256 is not None:
         context.update(stage="verifying_checksum")

@@ -3,6 +3,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from routes.download_router import router as download_router
+from routes.library_router import router as library_router
 from routes.model_router import router as model_router
 from routes.runtime_router import router as runtime_router
 from routes.system_router import router as system_router
@@ -18,7 +20,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="LocalAI",
     description=(
-        "Find models on Hugging Face, see what this machine can run, and manage the runtimes that run them."
+        "Find models on Hugging Face, see what this machine can run, download them, "
+        "and manage the runtimes that run them."
     ),
     lifespan=lifespan,
 )
@@ -30,6 +33,8 @@ def health_check() -> dict[str, str]:
 
 
 app.include_router(model_router, prefix="/models", tags=["Models"])
+app.include_router(download_router, prefix="/downloads", tags=["Downloads"])
+app.include_router(library_router, prefix="/library", tags=["Library"])
 app.include_router(system_router, prefix="/system", tags=["System"])
 app.include_router(runtime_router, prefix="/runtimes/llama.cpp", tags=["Runtimes"])
 
