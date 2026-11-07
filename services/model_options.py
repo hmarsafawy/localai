@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from models.hf_model import HfModelRequirements, HfRequirementRole, HfRoleOption
@@ -97,6 +97,10 @@ GGUF_FILE_TYPE_GUESSED = 1024
 
 # Not worth recommending over a real quantization: these are the source weights.
 _FULL_PRECISION = {"F16", "BF16", "F32", "F64", "FP16", "FP32", "ORIG"}
+
+
+class OptionChoiceError(ValueError):
+    """A requested option doesn't match, or matches more than one, of those on offer."""
 
 
 @dataclass(frozen=True)
@@ -455,6 +459,64 @@ def _pick_vision_encoder(options: list[HfRoleOption]) -> HfRoleOption | None:
         if match is not None:
             return match
     return options[0] if options else None
+
+
+def _gguf_options(
+    requirements: HfModelRequirements, is_wanted: Callable[[HfRequirementRole], bool]
+) -> list[HfRoleOption]:
+    return [
+        option
+        for role in requirements.roles
+        if is_wanted(role)
+        for option in role.options
+        if option.format == "gguf"
+    ]
+
+
+def language_model_options(requirements: HfModelRequirements) -> list[HfRoleOption]:
+    """What llama.cpp can run as the model itself: GGUF only."""
+    return _gguf_options(requirements, _is_language_model)
+
+
+def vision_encoder_options(requirements: HfModelRequirements) -> list[HfRoleOption]:
+    return _gguf_options(requirements, _is_vision_encoder)
+
+
+def match_option(options: list[HfRoleOption], wanted: str) -> HfRoleOption:
+    """The option someone means by `wanted`: its exact id (`mtp-Q4_0`), or else
+    its quantization, with or without `UD-` (`Q4_K_M` finds `UD-Q4_K_M`).
+    Raises `OptionChoiceError` rather than guess between several."""
+    folded = wanted.casefold()
+    exact = [option for option in options if option.id.casefold() == folded]
+    if exact:
+        return exact[0]
+
+    name = folded.removeprefix("ud-")
+    named = [
+        option
+        for option in options
+        if option.quantization and option.quantization.casefold().removeprefix("ud-") == name
+    ]
+    if len(named) == 1:
+        return named[0]
+    if named:
+        raise OptionChoiceError(
+            f"'{wanted}' could mean any of these, so pick one: {', '.join(option.id for option in named)}"
+        )
+    raise OptionChoiceError(
+        f"'{wanted}' isn't available. Available: {', '.join(option.id for option in options) or 'none'}"
+    )
+
+
+def default_option(options: list[HfRoleOption]) -> HfRoleOption | None:
+    """The one to use when nobody chose: the recommended option, or the only one
+    there is unless it's known not to fit. None if there's no sensible default."""
+    recommended = next((option for option in options if option.recommended), None)
+    if recommended is not None:
+        return recommended
+    if len(options) == 1 and options[0].fit != "too_large":
+        return options[0]
+    return None
 
 
 def annotate_fit(requirements: HfModelRequirements, budget: MemoryBudget | None) -> None:
