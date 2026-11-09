@@ -117,6 +117,18 @@ class UnsafeArchiveError(RuntimeInstallError):
 
 
 @dataclass(frozen=True)
+class LaunchableRuntime:
+    """An installed build that passed its test here, ready to run a model."""
+
+    id: str
+    # The folder holding `llama-server`.
+    directory: Path
+    backend: str
+    # The device to run on (`ROCm1`), or None to leave it to llama.cpp.
+    gpu_device: str | None
+
+
+@dataclass(frozen=True)
 class ParsedBuild:
     id: str
     tag: str
@@ -471,6 +483,12 @@ class LlamaRuntimeService:
         self._cache: dict[str, tuple[float, Any]] = {}
         self._cache_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._busy_checks: list[Callable[[str], str | None]] = []
+
+    def add_busy_check(self, check: Callable[[str], str | None]) -> None:
+        """`check(runtime_id)` returns why that runtime can't be deleted right
+        now, or None. It's how a running server keeps its build from going."""
+        self._busy_checks.append(check)
 
     @property
     def root(self) -> Path:
@@ -990,7 +1008,9 @@ class LlamaRuntimeService:
             raise RuntimeNotFoundError(f"No installed runtime called {runtime_id}")
         return path, build
 
-    def set_active(self, runtime_id: str) -> InstalledRuntimes:
+    def _usable(self, runtime_id: str) -> tuple[Path, ParsedBuild, dict[str, Any]]:
+        """An installed build that runs on this machine, re-tested if it hadn't
+        passed before."""
         path, build = self._installed_path(runtime_id)
         hardware = self.hardware.get_hardware()
         if (build.os, build.arch) != (hardware.os.system, hardware.os.arch):
@@ -1006,8 +1026,28 @@ class LlamaRuntimeService:
             raise RuntimeConflictError(
                 f"{runtime_id} didn't pass its test on this machine: {manifest.get('verification_error')}"
             )
+        return path, build, manifest
+
+    def set_active(self, runtime_id: str) -> InstalledRuntimes:
+        self._usable(runtime_id)
         self._set_active(runtime_id)
         return self.list_installed()
+
+    def launchable(self, runtime_id: str | None = None) -> LaunchableRuntime:
+        """The build to run a model with: the one named, or the active one."""
+        if runtime_id is None:
+            runtime_id = self._read_active()
+            if runtime_id is None:
+                raise RuntimeNotFoundError(
+                    "No llama.cpp runtime is active. Install one with POST /runtimes/llama.cpp/install."
+                )
+        path, build, manifest = self._usable(runtime_id)
+        directory = server_dir(path)
+        if directory is None:
+            raise RuntimeConflictError(f"{runtime_id} has no {server_binary_name()}")
+        return LaunchableRuntime(
+            id=runtime_id, directory=directory, backend=build.backend, gpu_device=manifest.get("gpu_device")
+        )
 
     def delete(self, runtime_id: str) -> None:
         path, _ = self._installed_path(runtime_id)
@@ -1015,6 +1055,10 @@ class LlamaRuntimeService:
             raise RuntimeConflictError(f"{runtime_id} is the active runtime. Switch to another one first.")
         if self.jobs.is_active(runtime_id):
             raise RuntimeConflictError(f"{runtime_id} is being installed right now")
+        for check in self._busy_checks:
+            reason = check(runtime_id)
+            if reason:
+                raise RuntimeConflictError(reason)
         shutil.rmtree(path)
 
     def _read_active(self) -> str | None:

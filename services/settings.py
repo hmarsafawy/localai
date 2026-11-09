@@ -35,5 +35,9 @@ def text_models_dir() -> Path:
     return models_dir() / TEXT_GENERATION_TASK
 
 
+def llama_server_logs_dir() -> Path:
+    return data_dir() / "logs" / "llama-server"
+
+
 def github_token() -> str | None:
     return os.getenv("GITHUB_TOKEN") or None

@@ -82,6 +82,10 @@ class LocalModelBusyError(Exception):
     """It's downloading, or something has its files open."""
 
 
+class LocalModelChoiceError(Exception):
+    """A quantization or vision encoder that doesn't pick out one downloaded option."""
+
+
 class ModelDownloadError(Exception):
     """A download that started and couldn't finish."""
 
@@ -102,6 +106,15 @@ class _Choice:
     @property
     def size_bytes(self) -> int:
         return sum(file.size for file in self.files)
+
+
+@dataclass(frozen=True)
+class LocalSelection:
+    """Downloaded files to run: a quantization, and a vision encoder if wanted."""
+
+    repo_id: str
+    model: LocalModelOption
+    vision: LocalModelOption | None
 
 
 def repo_folder_name(repo_id: str) -> str:
@@ -205,6 +218,12 @@ class ModelDownloadService:
         self.jobs = jobs or JobStore(max_concurrent=1)
         self.root = root or text_models_dir()
         self._lock = threading.Lock()
+        self._busy_checks: list[Callable[[str], str | None]] = []
+
+    def add_busy_check(self, check: Callable[[str], str | None]) -> None:
+        """`check(repo_id)` returns why that repo's files can't be deleted right
+        now, or None. It's how a running model keeps its files from going."""
+        self._busy_checks.append(check)
 
     # Starting a download
 
@@ -594,6 +613,98 @@ class ModelDownloadService:
             bytes_on_disk=on_disk,
         )
 
+    # Choosing what to run
+
+    def local_selection(self, repo_id: str, quantization: str = AUTO, vision_encoder: str = AUTO) -> LocalSelection:
+        """The downloaded files to run, which have to be complete. `auto` means
+        the only quantization downloaded, and a vision encoder if there is one."""
+        model = self._find_local(repo_id)
+        if model is None:
+            raise LocalModelNotFoundError(f"{repo_id} isn't in the library. Download it with POST /downloads first.")
+        downloading = self._downloading_options(model.repo_id)
+        chosen = self._pick_local_model(model, quantization)
+        self._check_runnable(model.repo_id, chosen, downloading)
+        vision = self._pick_local_vision(model, vision_encoder)
+        if vision is not None:
+            self._check_runnable(model.repo_id, vision, downloading)
+        return LocalSelection(repo_id=model.repo_id, model=chosen, vision=vision)
+
+    def _find_local(self, repo_id: str) -> LocalModel | None:
+        """Matched however it's capitalised, as it is on Hugging Face."""
+        wanted = repo_folder_name(repo_id).casefold()
+        if not self.root.is_dir():
+            return None
+        for folder in self.root.iterdir():
+            if folder.is_dir() and folder.name.casefold() == wanted:
+                manifest = _read_manifest(folder)
+                if manifest is not None:
+                    return self._local_model(folder, manifest)
+        return None
+
+    def _downloading_options(self, repo_id: str) -> set[str | None]:
+        return {
+            option
+            for job in self.jobs.all_jobs()
+            if job.status in ACTIVE_STATUSES and job.details.get("repo_id", "").casefold() == repo_id.casefold()
+            for option in (job.details.get("quantization"), job.details.get("vision_encoder"))
+        }
+
+    @staticmethod
+    def _match_local(options: list[LocalModelOption], wanted: str, what: str) -> LocalModelOption:
+        candidates = [
+            HfRoleOption(id=option.id, label=option.label, quantization=option.quantization) for option in options
+        ]
+        try:
+            matched = match_option(candidates, wanted)
+        except OptionChoiceError as error:
+            raise LocalModelChoiceError(f"{what} {error}") from error
+        return next(option for option in options if option.id == matched.id)
+
+    def _pick_local_model(self, model: LocalModel, wanted: str) -> LocalModelOption:
+        if wanted.casefold() != AUTO:
+            return self._match_local(model.quantizations, wanted, "Quantization")
+        complete = [option for option in model.quantizations if option.status == "complete"]
+        if len(complete) == 1:
+            return complete[0]
+        if complete:
+            raise LocalModelChoiceError(
+                f"{model.repo_id} has several quantizations downloaded, so pick one: "
+                f"{', '.join(option.id for option in complete)}"
+            )
+        if len(model.quantizations) == 1:
+            return model.quantizations[0]  # Unfinished, which `_check_runnable` explains.
+        raise LocalModelChoiceError(
+            f"{model.repo_id} has no quantization fully downloaded. Finish one with POST /downloads, "
+            f"or pick one: {', '.join(option.id for option in model.quantizations) or 'none'}"
+        )
+
+    def _pick_local_vision(self, model: LocalModel, wanted: str) -> LocalModelOption | None:
+        folded = wanted.casefold()
+        if folded == NONE:
+            return None
+        if folded != AUTO:
+            if not model.vision_encoders:
+                raise LocalModelChoiceError(f"{model.repo_id} has no vision encoder downloaded.")
+            return self._match_local(model.vision_encoders, wanted, "Vision encoder")
+        # Without one finished, it runs as text only rather than not at all.
+        complete = [option for option in model.vision_encoders if option.status == "complete"]
+        for preferred in ("F16", "BF16"):
+            match = next((option for option in complete if option.quantization == preferred), None)
+            if match is not None:
+                return match
+        return complete[0] if complete else None
+
+    @staticmethod
+    def _check_runnable(repo_id: str, option: LocalModelOption, downloading: set[str | None]) -> None:
+        if option.id in downloading:
+            raise LocalModelBusyError(f"{repo_id} {option.id} is still downloading.")
+        if option.status != "complete":
+            raise LocalModelBusyError(
+                f"{repo_id} {option.id} is only partly downloaded "
+                f"({option.bytes_on_disk / 1e9:.1f} of {option.size_bytes / 1e9:.1f} GB). "
+                "Start its download again to finish it."
+            )
+
     def delete(self, repo_id: str, quantization: str | None = None, vision_encoder: str | None = None) -> None:
         """Removes a repo's files, or only the options named, along with anything
         half downloaded. A running or queued download of the repo blocks this."""
@@ -606,6 +717,10 @@ class ModelDownloadService:
                 for job in self.jobs.all_jobs()
             ):
                 raise LocalModelBusyError(f"{repo_id} is downloading. Cancel that first.")
+            for check in self._busy_checks:
+                reason = check(repo_id)
+                if reason:
+                    raise LocalModelBusyError(reason)
             try:
                 if quantization is None and vision_encoder is None:
                     shutil.rmtree(folder)
