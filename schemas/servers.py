@@ -16,9 +16,11 @@ class ServerLaunchRequest(BaseModel):
     default it runs the only quantization downloaded, with a vision encoder if
     one is; `vision_encoder` can also be `none`.
 
-    Anything left unset, llama.cpp sizes to the memory free when the model loads:
-    the model's full context, cut down if it wouldn't fit, and as many layers on
-    the GPU as fit there."""
+    Anything left unset, llama.cpp sizes to the VRAM that's really free when the
+    model loads, leaving room for the vision encoder and what other programs
+    use: the model's full context, cut down if it wouldn't fit, and as many
+    layers on the GPU as fit there. `gpu_layers` as a number keeps the model
+    memory-mapped, since some of it usually stays on the CPU; `all` doesn't."""
 
     # Without this, the docs page fills in each number's minimum, so trying it
     # out as given would load a model with a 512-token context. The optional
@@ -40,7 +42,7 @@ class ServerLaunchRequest(BaseModel):
     quantization: str = Field(default="auto", pattern=OPTION_PATTERN, max_length=200)
     vision_encoder: str = Field(default="auto", pattern=OPTION_PATTERN, max_length=200)
     context_size: int | None = Field(default=None, ge=512, le=4_194_304)
-    # 0 runs on the CPU only.
+    # 0 runs on the CPU only, `all` puts every layer on the GPU whatever fits.
     gpu_layers: Annotated[int, Field(ge=0, le=10_000)] | Literal["auto", "all"] = "auto"
     # By default, the first free port from 8080.
     port: int | None = Field(default=None, ge=1024, le=65535)

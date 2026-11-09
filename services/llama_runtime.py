@@ -72,7 +72,9 @@ _COMPANION_NAME = re.compile(
 )
 _ARCHIVE_SUFFIX = re.compile(r"\.(?:zip|tar\.gz)$")
 _SAFE_RUNTIME_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_DEVICE_LINE = re.compile(r"^\s*(?P<id>[^\s:]+):\s+(?P<name>.+?)\s+\((?P<total>\d+) MiB,\s*\d+ MiB free\)\s*$")
+_DEVICE_LINE = re.compile(
+    r"^\s*(?P<id>[^\s:]+):\s+(?P<name>.+?)\s+\((?P<total>\d+) MiB,\s*(?P<free>\d+) MiB free\)\s*$"
+)
 _VERSION_LINE = re.compile(r"version:\s*(?P<version>\S+)\s*\(build\s*(?P<build>\d+),\s*commit\s*(?P<commit>\w+)\)")
 _STABLE_BUILD_TAG = re.compile(r"\bb\d{4,6}\b")
 
@@ -267,8 +269,27 @@ def parse_list_devices(output: str) -> list[RuntimeDevice]:
     return devices
 
 
+def parse_device_free_memory(output: str) -> dict[str, int]:
+    """Device id -> bytes free, as the backend sees it. ROCm on Windows ignores
+    what other programs are using, so this can be far more than is free."""
+    free: dict[str, int] = {}
+    for line in output.splitlines():
+        match = _DEVICE_LINE.match(line)
+        if match:
+            free[match["id"]] = int(match["free"]) * 1024**2
+    return free
+
+
 def _normalized_gpu_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", name.lower())
+
+
+def same_gpu_name(device_name: str, gpu_name: str) -> bool:
+    """Whether a runtime's device and a GPU the hardware lists are the same model
+    of card. A backend can add or drop a word at either end, such as `NVIDIA`,
+    so either name can contain the other."""
+    device, gpu = _normalized_gpu_name(device_name), _normalized_gpu_name(gpu_name)
+    return bool(device and gpu) and (device in gpu or gpu in device)
 
 
 def match_gpu_device(devices: list[RuntimeDevice], gpus: list[GpuInfo]) -> str | None:
@@ -277,13 +298,12 @@ def match_gpu_device(devices: list[RuntimeDevice], gpus: list[GpuInfo]) -> str |
     integrated GPU as owning most of the system's RAM."""
     if not devices:
         return None
-    by_kind: dict[str, set[str]] = {}
+    by_kind: dict[str, list[str]] = {}
     for gpu in gpus:
-        by_kind.setdefault(gpu.kind, set()).add(_normalized_gpu_name(gpu.name))
+        by_kind.setdefault(gpu.kind, []).append(gpu.name)
 
     def is_kind(device: RuntimeDevice, kind: str) -> bool:
-        name = _normalized_gpu_name(device.name)
-        return any(known and (known in name or name in known) for known in by_kind.get(kind, ()))
+        return any(same_gpu_name(device.name, known) for known in by_kind.get(kind, ()))
 
     for kind in ("discrete", "unified"):
         match = next((device for device in devices if is_kind(device, kind)), None)
@@ -1048,6 +1068,16 @@ class LlamaRuntimeService:
         return LaunchableRuntime(
             id=runtime_id, directory=directory, backend=build.backend, gpu_device=manifest.get("gpu_device")
         )
+
+    @staticmethod
+    def current_devices(runtime: LaunchableRuntime) -> tuple[list[RuntimeDevice], dict[str, int]] | None:
+        """The devices a build sees right now, and the memory it thinks each has
+        free, or None if it couldn't be asked. Numbering can change after the
+        build was tested, when a GPU is added or disabled."""
+        code, output = _run_server_command(runtime.directory, runtime.backend, "--list-devices")
+        if code != 0:
+            return None
+        return parse_list_devices(output), parse_device_free_memory(output)
 
     def delete(self, runtime_id: str) -> None:
         path, _ = self._installed_path(runtime_id)

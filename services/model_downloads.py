@@ -117,6 +117,10 @@ class LocalSelection:
     vision: LocalModelOption | None
 
 
+# (repo id, the (role, option id) pairs being deleted or None for all) -> why not.
+BusyCheck = Callable[[str, set[tuple[str, str]] | None], str | None]
+
+
 def repo_folder_name(repo_id: str) -> str:
     return repo_id.replace("/", "--")
 
@@ -218,11 +222,13 @@ class ModelDownloadService:
         self.jobs = jobs or JobStore(max_concurrent=1)
         self.root = root or text_models_dir()
         self._lock = threading.Lock()
-        self._busy_checks: list[Callable[[str], str | None]] = []
+        self._busy_checks: list[BusyCheck] = []
 
-    def add_busy_check(self, check: Callable[[str], str | None]) -> None:
-        """`check(repo_id)` returns why that repo's files can't be deleted right
-        now, or None. It's how a running model keeps its files from going."""
+    def add_busy_check(self, check: BusyCheck) -> None:
+        """`check(repo_id, options)` returns why those files can't be deleted
+        right now, or None. `options` holds the (role, option id) pairs being
+        deleted, or is None for the whole repo. It's how a running model keeps
+        its own files without blocking the deletion of others."""
         self._busy_checks.append(check)
 
     # Starting a download
@@ -717,20 +723,28 @@ class ModelDownloadService:
                 for job in self.jobs.all_jobs()
             ):
                 raise LocalModelBusyError(f"{repo_id} is downloading. Cancel that first.")
+            whole = quantization is None and vision_encoder is None
+            manifest, doomed = (
+                (None, []) if whole else self._doomed_options(folder, repo_id, quantization, vision_encoder)
+            )
+            options = None if whole else {(record.get("role"), record["id"]) for record in doomed}
             for check in self._busy_checks:
-                reason = check(repo_id)
+                reason = check(repo_id, options)
                 if reason:
                     raise LocalModelBusyError(reason)
             try:
-                if quantization is None and vision_encoder is None:
+                if manifest is None:
                     shutil.rmtree(folder)
                 else:
-                    self._delete_options(folder, repo_id, quantization, vision_encoder)
+                    self._delete_options(folder, manifest, doomed)
             except PermissionError as error:
                 raise LocalModelBusyError(f"Something has {repo_id}'s files open: {error}") from error
 
     @staticmethod
-    def _delete_options(folder: Path, repo_id: str, quantization: str | None, vision_encoder: str | None) -> None:
+    def _doomed_options(
+        folder: Path, repo_id: str, quantization: str | None, vision_encoder: str | None
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """The manifest, and the records of the options named."""
         manifest = _read_manifest(folder)
         if manifest is None:
             raise LocalModelNotFoundError(f"{repo_id} has no readable record of its options")
@@ -749,7 +763,10 @@ class ModelDownloadService:
             except OptionChoiceError as error:
                 raise LocalModelNotFoundError(f"{repo_id}: {error}") from error
             doomed.append(next(record for record in records if record["id"] == matched.id))
+        return manifest, doomed
 
+    @staticmethod
+    def _delete_options(folder: Path, manifest: dict[str, Any], doomed: list[dict[str, Any]]) -> None:
         manifest["options"] = [record for record in manifest["options"] if record not in doomed]
         if not manifest["options"]:
             shutil.rmtree(folder)
