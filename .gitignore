@@ -230,3 +230,6 @@ __marimo__/
 /requirements-dev.txt
 
 /model-files/
+
+# llama-server output, one file per launch
+/logs/

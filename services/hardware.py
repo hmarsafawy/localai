@@ -95,6 +95,14 @@ $ErrorActionPreference = 'Stop'
 @(Get-CimInstance Win32_PerfRawData_GPUPerformanceCounters_GPUAdapterMemory | Select-Object Name,DedicatedUsage) | ConvertTo-Json -Compress
 """
 
+# One process's GPU memory per adapter. `[_]` because `_` alone matches any
+# character, so pid 12 would also match pid 123.
+_WINDOWS_PROCESS_GPU_MEMORY_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+@(Get-CimInstance Win32_PerfRawData_GPUPerformanceCounters_GPUProcessMemory -Filter "Name LIKE 'pid_{pid}[_]%'" | Select-Object Name,DedicatedUsage,SharedUsage) | ConvertTo-Json -Compress
+"""
+
 
 @dataclass
 class _GpuFacts:
@@ -379,6 +387,20 @@ def parse_gpu_memory_counters(rows: Any) -> dict[str, int]:
     return usage
 
 
+def parse_process_gpu_memory(rows: Any, luids: set[str]) -> tuple[int, int] | None:
+    """(in VRAM, in system RAM) for the adapters named, from one process's GPU
+    counters, or None if it has none there."""
+    vram = system_ram = 0
+    found = False
+    for row in _as_list(rows):
+        match = re.search(r"(luid_0x[0-9a-f]+_0x[0-9a-f]+)", str(row.get("Name", "")), re.IGNORECASE)
+        if match and match.group(1).lower() in luids:
+            found = True
+            vram += int(row.get("DedicatedUsage") or 0)
+            system_ram += int(row.get("SharedUsage") or 0)
+    return (vram, system_ram) if found else None
+
+
 def select_real_adapters(adapters: list[dict[str, Any]], live_luids: set[str]) -> list[dict[str, Any]]:
     """Drops software adapters and duplicates. Windows can list one card twice
     under different LUIDs (seen alongside a virtual display driver); only the
@@ -548,6 +570,22 @@ class HardwareService:
             return budget_from_hardware(self.get_hardware())
         except Exception:
             logger.exception("Could not read the hardware for a memory estimate")
+            return None
+
+    def process_gpu_memory(self, pid: int, gpu_name: str) -> tuple[int, int] | None:
+        """How much of a process's memory on a GPU is in VRAM and how much
+        Windows placed in system RAM, or None where that can't be read. Only
+        Windows reports it per process."""
+        if sys.platform != "win32":
+            return None
+        try:
+            luids = {gpu.luid for gpu in self._static_facts().gpus if gpu.name == gpu_name and gpu.luid}
+            if not luids:
+                return None
+            rows = _powershell_json(_WINDOWS_PROCESS_GPU_MEMORY_SCRIPT.replace("{pid}", str(int(pid))), timeout=20)
+            return parse_process_gpu_memory(rows, luids)
+        except Exception:
+            logger.exception("Could not read the GPU memory of process %s", pid)
             return None
 
     def _static_facts(self, refresh: bool = False) -> _StaticFacts:

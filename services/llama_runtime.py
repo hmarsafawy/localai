@@ -72,7 +72,9 @@ _COMPANION_NAME = re.compile(
 )
 _ARCHIVE_SUFFIX = re.compile(r"\.(?:zip|tar\.gz)$")
 _SAFE_RUNTIME_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_DEVICE_LINE = re.compile(r"^\s*(?P<id>[^\s:]+):\s+(?P<name>.+?)\s+\((?P<total>\d+) MiB,\s*\d+ MiB free\)\s*$")
+_DEVICE_LINE = re.compile(
+    r"^\s*(?P<id>[^\s:]+):\s+(?P<name>.+?)\s+\((?P<total>\d+) MiB,\s*(?P<free>\d+) MiB free\)\s*$"
+)
 _VERSION_LINE = re.compile(r"version:\s*(?P<version>\S+)\s*\(build\s*(?P<build>\d+),\s*commit\s*(?P<commit>\w+)\)")
 _STABLE_BUILD_TAG = re.compile(r"\bb\d{4,6}\b")
 
@@ -114,6 +116,18 @@ class RuntimeInstallError(Exception):
 
 class UnsafeArchiveError(RuntimeInstallError):
     """An archive tried to write outside its destination."""
+
+
+@dataclass(frozen=True)
+class LaunchableRuntime:
+    """An installed build that passed its test here, ready to run a model."""
+
+    id: str
+    # The folder holding `llama-server`.
+    directory: Path
+    backend: str
+    # The device to run on (`ROCm1`), or None to leave it to llama.cpp.
+    gpu_device: str | None
 
 
 @dataclass(frozen=True)
@@ -255,8 +269,27 @@ def parse_list_devices(output: str) -> list[RuntimeDevice]:
     return devices
 
 
+def parse_device_free_memory(output: str) -> dict[str, int]:
+    """Device id -> bytes free, as the backend sees it. ROCm on Windows ignores
+    what other programs are using, so this can be far more than is free."""
+    free: dict[str, int] = {}
+    for line in output.splitlines():
+        match = _DEVICE_LINE.match(line)
+        if match:
+            free[match["id"]] = int(match["free"]) * 1024**2
+    return free
+
+
 def _normalized_gpu_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", name.lower())
+
+
+def same_gpu_name(device_name: str, gpu_name: str) -> bool:
+    """Whether a runtime's device and a GPU the hardware lists are the same model
+    of card. A backend can add or drop a word at either end, such as `NVIDIA`,
+    so either name can contain the other."""
+    device, gpu = _normalized_gpu_name(device_name), _normalized_gpu_name(gpu_name)
+    return bool(device and gpu) and (device in gpu or gpu in device)
 
 
 def match_gpu_device(devices: list[RuntimeDevice], gpus: list[GpuInfo]) -> str | None:
@@ -265,13 +298,12 @@ def match_gpu_device(devices: list[RuntimeDevice], gpus: list[GpuInfo]) -> str |
     integrated GPU as owning most of the system's RAM."""
     if not devices:
         return None
-    by_kind: dict[str, set[str]] = {}
+    by_kind: dict[str, list[str]] = {}
     for gpu in gpus:
-        by_kind.setdefault(gpu.kind, set()).add(_normalized_gpu_name(gpu.name))
+        by_kind.setdefault(gpu.kind, []).append(gpu.name)
 
     def is_kind(device: RuntimeDevice, kind: str) -> bool:
-        name = _normalized_gpu_name(device.name)
-        return any(known and (known in name or name in known) for known in by_kind.get(kind, ()))
+        return any(same_gpu_name(device.name, known) for known in by_kind.get(kind, ()))
 
     for kind in ("discrete", "unified"):
         match = next((device for device in devices if is_kind(device, kind)), None)
@@ -471,6 +503,12 @@ class LlamaRuntimeService:
         self._cache: dict[str, tuple[float, Any]] = {}
         self._cache_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._busy_checks: list[Callable[[str], str | None]] = []
+
+    def add_busy_check(self, check: Callable[[str], str | None]) -> None:
+        """`check(runtime_id)` returns why that runtime can't be deleted right
+        now, or None. It's how a running server keeps its build from going."""
+        self._busy_checks.append(check)
 
     @property
     def root(self) -> Path:
@@ -990,7 +1028,9 @@ class LlamaRuntimeService:
             raise RuntimeNotFoundError(f"No installed runtime called {runtime_id}")
         return path, build
 
-    def set_active(self, runtime_id: str) -> InstalledRuntimes:
+    def _usable(self, runtime_id: str) -> tuple[Path, ParsedBuild, dict[str, Any]]:
+        """An installed build that runs on this machine, re-tested if it hadn't
+        passed before."""
         path, build = self._installed_path(runtime_id)
         hardware = self.hardware.get_hardware()
         if (build.os, build.arch) != (hardware.os.system, hardware.os.arch):
@@ -1006,8 +1046,38 @@ class LlamaRuntimeService:
             raise RuntimeConflictError(
                 f"{runtime_id} didn't pass its test on this machine: {manifest.get('verification_error')}"
             )
+        return path, build, manifest
+
+    def set_active(self, runtime_id: str) -> InstalledRuntimes:
+        self._usable(runtime_id)
         self._set_active(runtime_id)
         return self.list_installed()
+
+    def launchable(self, runtime_id: str | None = None) -> LaunchableRuntime:
+        """The build to run a model with: the one named, or the active one."""
+        if runtime_id is None:
+            runtime_id = self._read_active()
+            if runtime_id is None:
+                raise RuntimeNotFoundError(
+                    "No llama.cpp runtime is active. Install one with POST /runtimes/llama.cpp/install."
+                )
+        path, build, manifest = self._usable(runtime_id)
+        directory = server_dir(path)
+        if directory is None:
+            raise RuntimeConflictError(f"{runtime_id} has no {server_binary_name()}")
+        return LaunchableRuntime(
+            id=runtime_id, directory=directory, backend=build.backend, gpu_device=manifest.get("gpu_device")
+        )
+
+    @staticmethod
+    def current_devices(runtime: LaunchableRuntime) -> tuple[list[RuntimeDevice], dict[str, int]] | None:
+        """The devices a build sees right now, and the memory it thinks each has
+        free, or None if it couldn't be asked. Numbering can change after the
+        build was tested, when a GPU is added or disabled."""
+        code, output = _run_server_command(runtime.directory, runtime.backend, "--list-devices")
+        if code != 0:
+            return None
+        return parse_list_devices(output), parse_device_free_memory(output)
 
     def delete(self, runtime_id: str) -> None:
         path, _ = self._installed_path(runtime_id)
@@ -1015,6 +1085,10 @@ class LlamaRuntimeService:
             raise RuntimeConflictError(f"{runtime_id} is the active runtime. Switch to another one first.")
         if self.jobs.is_active(runtime_id):
             raise RuntimeConflictError(f"{runtime_id} is being installed right now")
+        for check in self._busy_checks:
+            reason = check(runtime_id)
+            if reason:
+                raise RuntimeConflictError(reason)
         shutil.rmtree(path)
 
     def _read_active(self) -> str | None:
