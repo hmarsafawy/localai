@@ -41,3 +41,8 @@ def llama_server_logs_dir() -> Path:
 
 def github_token() -> str | None:
     return os.getenv("GITHUB_TOKEN") or None
+
+
+def api_key() -> str | None:
+    """What `/v1` requests must send as a bearer token. None leaves it open."""
+    return os.getenv("LOCALAI_API_KEY") or None

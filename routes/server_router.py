@@ -22,10 +22,10 @@ async def launch_server(request: ServerLaunchRequest) -> ModelServer:
     """Starts llama-server on a downloaded model, and returns while it loads.
     Poll `GET /servers/{id}` until `status` is `ready`, or `failed` with the reason.
 
-    Once it's ready, `base_url` is llama.cpp's own chat page, and its
-    OpenAI-compatible API is at `base_url` + `/v1`, with `model_name` as the
-    `model`. It only listens on this machine. Launching a model that's already
-    running with the same settings returns that server."""
+    Once it's ready, it's served by this app's OpenAI-compatible API at `/v1`,
+    with `model_name` as the `model`. `base_url` is llama.cpp's own chat page,
+    which only works on this machine. Launching a model that's already running
+    with the same settings returns that server."""
     launch = partial(
         service.launch,
         request.repo_id,

@@ -9,7 +9,9 @@
   Windows a mapping keeps the whole file in RAM too. One that doesn't fit keeps
   the default, because reading it in pins its CPU part in RAM for good.
 - A server listens on 127.0.0.1 only. The app itself may be reachable from the
-  network, but llama-server has no authentication of its own.
+  network, but llama-server has no authentication of its own. Other machines
+  reach a model through the app's `/v1` API, which finds its server by the
+  request's `model`.
 - A server mustn't outlive the app, or it goes on holding GPU memory and its
   port. They're stopped when the app shuts down, and on Windows they're also
   tied to the app's process, so they go even if the app is killed.
@@ -92,7 +94,14 @@ SPILL_WARNING_BYTES = 1024**3
 # llama-server takes settings from the environment too. The app passes everything
 # it wants as arguments, and the server has no use for the app's tokens.
 _ENVIRONMENT_SETTING_PREFIX = "LLAMA_ARG_"
-_WITHHELD_VARIABLES = {"LLAMA_API_KEY", "MTMD_BACKEND_DEVICE", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "GITHUB_TOKEN"}
+_WITHHELD_VARIABLES = {
+    "LLAMA_API_KEY",
+    "MTMD_BACKEND_DEVICE",
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+    "GITHUB_TOKEN",
+    "LOCALAI_API_KEY",
+}
 # `0.00.057.977 E gguf_init_from_file: failed to open GGUF file ...`
 _ERROR_LINE = re.compile(r"^\S+ E (?P<message>.+)$")
 
@@ -107,6 +116,14 @@ class ServerConflictError(Exception):
 
 class ServerStartError(Exception):
     """The process couldn't be started at all."""
+
+
+class ModelNotRunningError(Exception):
+    """No running server matches the model a request names, or several do."""
+
+
+class ModelLoadingError(Exception):
+    """The server for that model is still loading it."""
 
 
 def _now() -> datetime:
@@ -805,6 +822,37 @@ class LlamaServerService:
         """Newest first, including recently stopped ones."""
         with self._lock:
             return [server.info.model_copy(deep=True) for server in reversed(self._servers.values())]
+
+    def find_running(self, model: str | None) -> ModelServer:
+        """The server an API request is for. `model` is its `model_name`, or a
+        repo id when only one of that repo's quantizations is running. Without
+        one, the only model running."""
+        with self._lock:
+            live = [
+                server.info
+                for server in reversed(self._servers.values())
+                if server.info.status in ("starting", "ready")
+            ]
+            if model:
+                wanted = model.casefold()
+                matches = [info for info in live if info.model_name.casefold() == wanted] or [
+                    info for info in live if info.repo_id.casefold() == wanted
+                ]
+            else:
+                matches = live
+            if len(matches) == 1:
+                found = matches[0].model_copy(deep=True)
+                if found.status == "starting":
+                    raise ModelLoadingError(f"{found.model_name} is still loading. Try again once it's ready.")
+                return found
+        if matches:
+            which = f"Several running models match {model}" if model else "Several models are running"
+            names = ", ".join(info.model_name for info in matches)
+            raise ModelNotRunningError(f"{which}: {names}. Send one of them as `model`.")
+        if not live:
+            raise ModelNotRunningError("No model is running. Launch one with POST /servers first.")
+        names = ", ".join(info.model_name for info in live)
+        raise ModelNotRunningError(f"{model} isn't running. Running: {names}. Launch it with POST /servers first.")
 
     def logs(self, server_id: str, lines: int = 200) -> ServerLogs:
         info = self.get(server_id)
