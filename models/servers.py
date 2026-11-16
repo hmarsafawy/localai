@@ -70,9 +70,10 @@ class ModelServer(BaseModel):
     gpu_plan: GpuPlan | None = None
     host: str
     port: int
-    # llama.cpp's own chat page. Its OpenAI-compatible API is under `/v1`.
+    # llama.cpp's own chat page, on this machine only. The app serves the model
+    # at its own `/v1`, which other machines can reach too.
     base_url: str
-    # What to send as `model` in API requests.
+    # What to send as `model` to the app's `/v1` API.
     model_name: str
     loaded: LoadedModel | None = None
     # Things that work but not as well as they should, such as memory that
