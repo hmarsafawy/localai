@@ -4,10 +4,10 @@ from contextlib import asynccontextmanager
 from anyio import to_thread
 from fastapi import FastAPI
 
-from routes.download_router import router as download_router
+from routes.huggingface_router import router as huggingface_router
+from routes.inference_router import OpenAIError, openai_error_handler, router as inference_router
 from routes.library_router import router as library_router
-from routes.model_router import router as model_router
-from routes.openai_router import OpenAIError, openai_error_handler, router as openai_router
+from routes.model_download_router import router as model_download_router
 from routes.runtime_router import router as runtime_router
 from routes.server_router import router as server_router
 from routes.system_router import router as system_router
@@ -42,13 +42,13 @@ def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
 
-app.include_router(model_router, prefix="/models", tags=["Models"])
-app.include_router(download_router, prefix="/downloads", tags=["Downloads"])
+app.include_router(huggingface_router, prefix="/models", tags=["Hugging Face"])
+app.include_router(model_download_router, prefix="/downloads", tags=["Model downloads"])
 app.include_router(library_router, prefix="/library", tags=["Library"])
 app.include_router(system_router, prefix="/system", tags=["System"])
 app.include_router(runtime_router, prefix="/runtimes/llama.cpp", tags=["Runtimes"])
 app.include_router(server_router, prefix="/servers", tags=["Servers"])
-app.include_router(openai_router, prefix="/v1", tags=["OpenAI-compatible"])
+app.include_router(inference_router, prefix="/v1", tags=["Inference"])
 
 
 if __name__ == "__main__":
