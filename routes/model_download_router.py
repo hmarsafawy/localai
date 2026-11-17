@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException, status
 from huggingface_hub.utils import HfHubHTTPError
 
 from models.jobs import JobInfo
-from routes.model_router import map_hf_error
+from routes.huggingface_router import map_hf_error
 from schemas.downloads import ModelDownloadRequest
 from schemas.runtime import JobResponse
 from services.model_downloads import (
