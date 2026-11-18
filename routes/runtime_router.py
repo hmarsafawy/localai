@@ -1,8 +1,10 @@
 from anyio import to_thread
 from fastapi import APIRouter, Body, HTTPException, Query, Response, status
+from fastapi.responses import StreamingResponse
 
 from models.jobs import JobInfo
 from models.runtime import AvailableBuilds, InstalledRuntimes
+from routes.job_events import EVENT_STREAM_RESPONSES, job_events
 from schemas.runtime import (
     VERSION_PATTERN,
     AvailableBuildsResponse,
@@ -20,6 +22,8 @@ from services.llama_runtime import (
 )
 
 router = APIRouter()
+
+_NO_SUCH_JOB = "No such job. Jobs don't survive a restart of the app."
 
 
 def _map_runtime_error(error: Exception) -> HTTPException:
@@ -67,12 +71,25 @@ async def install_runtime(request: RuntimeInstallRequest | None = Body(default=N
         raise _map_runtime_error(error) from error
 
 
+@router.get("/jobs", response_model=list[JobResponse])
+async def list_jobs() -> list[JobInfo]:
+    """Every install since the app started, newest first."""
+    return service.jobs.all_jobs()
+
+
 @router.get("/jobs/{job_id}", response_model=JobResponse)
 async def get_job(job_id: str) -> JobInfo:
     job = service.jobs.get(job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail="No such job. Jobs don't survive a restart of the app.")
+        raise HTTPException(status_code=404, detail=_NO_SUCH_JOB)
     return job
+
+
+@router.get("/jobs/{job_id}/events", response_class=StreamingResponse, responses=EVENT_STREAM_RESPONSES)
+async def follow_job(job_id: str) -> StreamingResponse:
+    """The job's progress as it happens, as server-sent events, instead of
+    polling `GET /jobs/{job_id}`. It ends once the job has finished."""
+    return job_events(service.jobs, job_id, _NO_SUCH_JOB)
 
 
 @router.delete("/jobs/{job_id}", response_model=JobResponse)
@@ -81,7 +98,7 @@ async def cancel_job(job_id: str) -> JobInfo:
     same build again picks up from there."""
     job = service.jobs.cancel(job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail="No such job. Jobs don't survive a restart of the app.")
+        raise HTTPException(status_code=404, detail=_NO_SUCH_JOB)
     return job
 
 

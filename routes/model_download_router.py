@@ -1,9 +1,11 @@
 from anyio import to_thread
 from fastapi import APIRouter, HTTPException, status
+from fastapi.responses import StreamingResponse
 from huggingface_hub.utils import HfHubHTTPError
 
 from models.jobs import JobInfo
 from routes.huggingface_router import map_hf_error
+from routes.job_events import EVENT_STREAM_RESPONSES, job_events
 from schemas.downloads import ModelDownloadRequest
 from schemas.runtime import JobResponse
 from services.model_downloads import (
@@ -55,6 +57,13 @@ async def get_download(job_id: str) -> JobInfo:
     if job is None:
         raise HTTPException(status_code=404, detail=_NO_SUCH_JOB)
     return job
+
+
+@router.get("/{job_id}/events", response_class=StreamingResponse, responses=EVENT_STREAM_RESPONSES)
+async def follow_download(job_id: str) -> StreamingResponse:
+    """The download's progress as it happens, as server-sent events, instead of
+    polling `GET /downloads/{job_id}`. It ends once the download has finished."""
+    return job_events(service.jobs, job_id, _NO_SUCH_JOB)
 
 
 @router.delete("/{job_id}", response_model=JobResponse)

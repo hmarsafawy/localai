@@ -8,13 +8,14 @@ file on disk, so running the job again picks up where it stopped.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +32,12 @@ MAX_FINISHED_JOBS = 100
 DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 SPEED_SAMPLE_SECONDS = 0.5
 DOWNLOAD_TIMEOUT = httpx.Timeout(30.0, read=60.0)
+# How often someone following a job looks for changes. Its speed doesn't change
+# any faster than this.
+FOLLOW_INTERVAL_SECONDS = SPEED_SAMPLE_SECONDS
+# A job that's queued or checking a checksum can go quiet for minutes. Sending
+# it again after this long keeps the connection from looking dead.
+FOLLOW_KEEPALIVE_SECONDS = 15.0
 
 
 class JobCancelled(Exception):
@@ -135,6 +142,26 @@ class JobStore:
         """Newest first."""
         with self.lock:
             return [record.info.model_copy(deep=True) for record in reversed(self._jobs.values())]
+
+    async def follow(
+        self,
+        job_id: str,
+        interval: float = FOLLOW_INTERVAL_SECONDS,
+        keepalive: float = FOLLOW_KEEPALIVE_SECONDS,
+    ) -> AsyncIterator[JobInfo]:
+        """The job as it is now, then again each time it changes, ending with
+        the job as it finished. Nothing for a job there isn't. A job that hasn't
+        changed is given again every `keepalive` seconds."""
+        last: JobInfo | None = None
+        sent_at = 0.0
+        while (job := self.get(job_id)) is not None:
+            now = time.monotonic()
+            if job != last or now - sent_at >= keepalive:
+                yield job
+                last, sent_at = job, now
+            if job.status not in ACTIVE_STATUSES:
+                return
+            await asyncio.sleep(interval)
 
     def cancel(self, job_id: str) -> JobInfo | None:
         """Asks a job to stop. It's a request: the job stops at its next check,
