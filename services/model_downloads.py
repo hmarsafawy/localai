@@ -224,6 +224,29 @@ def _source_files(repo_id: str, info: Any, weights: HfRoleOption) -> tuple[_Repo
     return tuple(files)
 
 
+def _converter_weights(info: Any) -> HfRoleOption | None:
+    """The top folder's `model*.safetensors`, which is what llama.cpp's converter
+    reads. For a model whose tensor names weren't recognised, such as a new or
+    custom architecture: whether the converter knows it is up to its config.json."""
+    sizes = {
+        sibling.rfilename: getattr(sibling, "size", None) or 0
+        for sibling in getattr(info, "siblings", None) or []
+        if "/" not in sibling.rfilename
+        and sibling.rfilename.startswith("model")
+        and sibling.rfilename.endswith(".safetensors")
+    }
+    if not sizes:
+        return None
+    return HfRoleOption(
+        id="safetensors",
+        label="safetensors",
+        format="safetensors",
+        files=sorted(sizes),
+        shards=len(sizes),
+        size_bytes=sum(sizes.values()),
+    )
+
+
 def _architecture(info: Any) -> str | None:
     """What the model is, as its `config.json` names it (`LlamaForCausalLM`)."""
     config = getattr(info, "config", None) or {}
@@ -520,7 +543,7 @@ class ModelDownloadService:
         resolved_id = getattr(info, "id", None) or repo_id
         revision = getattr(info, "sha", None)
         requirements = self.hf.get_model_requirements(resolved_id)
-        weights = self._safetensors_weights(resolved_id, requirements)
+        weights = self._safetensors_weights(resolved_id, info, requirements)
         files = _source_files(resolved_id, info, weights)
         self._check_access(resolved_id, revision, weights.files[0])
         if vision_encoder.casefold() not in (AUTO, NONE):
@@ -586,7 +609,7 @@ class ModelDownloadService:
         )
 
     @staticmethod
-    def _safetensors_weights(repo_id: str, requirements: HfModelRequirements) -> HfRoleOption:
+    def _safetensors_weights(repo_id: str, info: Any, requirements: HfModelRequirements) -> HfRoleOption:
         options = [
             option
             for role in requirements.roles
@@ -594,6 +617,10 @@ class ModelDownloadService:
             for option in role.options
             if option.format == "safetensors"
         ]
+        if not options and not any(role.present for role in requirements.roles):
+            unrecognised = _converter_weights(info)
+            if unrecognised is not None:
+                return unrecognised
         if not options:
             formats = sorted({option.format for role in requirements.roles for option in role.options if option.format})
             found = f" It has {', '.join(formats)} weights, which aren't safe or can't be converted." if formats else ""
