@@ -29,6 +29,7 @@ import time
 import zlib
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -77,6 +78,7 @@ CHECK_TIMEOUT_SECONDS = 5 * 60
 OUTPUT_TAIL_LINES = 20
 
 _SAFE_TAG = re.compile(r"^b\d+$")
+_LINE_BREAK = re.compile(rb"\r\n|\r|\n")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 # `TEXT models:` or `ERROR:hf-to-gguf:MMPROJ models:`, then `  - LlamaForCausalLM`.
 _MODELS_SECTION = re.compile(r"\b(?P<kind>[A-Z]+) models:\s*$")
@@ -99,6 +101,14 @@ _WITHHELD_VARIABLES = {
 
 class ConverterSpaceError(RuntimeInstallError):
     """The drive holding the converters is too full to set one up."""
+
+
+@dataclass(frozen=True)
+class ConverterCommand:
+    """What runs a build's converter: its environment's Python, and the script."""
+
+    python: Path
+    script: Path
 
 
 def run_command(
@@ -126,9 +136,16 @@ def run_command(
     lines: queue.Queue[str | None] = queue.Queue()
 
     def read() -> None:
+        # By `\r` as well as `\n`: a progress bar redraws its line with `\r`.
         assert process.stdout is not None
-        for raw in process.stdout:
-            lines.put(raw.decode("utf-8", "replace").rstrip())
+        pending = b""
+        while chunk := process.stdout.read1(65536):  # type: ignore[attr-defined]
+            *complete, pending = _LINE_BREAK.split(pending + chunk)
+            for raw in complete:
+                if raw.strip():
+                    lines.put(raw.decode("utf-8", "replace").rstrip())
+        if pending.strip():
+            lines.put(pending.decode("utf-8", "replace").rstrip())
         lines.put(None)
 
     threading.Thread(target=read, name="converter-output", daemon=True).start()
@@ -287,6 +304,7 @@ class LlamaConverterService:
         self.jobs = jobs or runtimes.jobs
         self._lock = threading.Lock()
         self._environment_locks: dict[str, threading.Lock] = {}
+        self._tag_locks: dict[str, threading.Lock] = {}
 
     @property
     def root(self) -> Path:
@@ -309,10 +327,30 @@ class LlamaConverterService:
 
     # What's installed
 
-    def status(self) -> LlamaConverters:
+    def active_tag(self) -> str | None:
+        """The active runtime's tag, whose converter models are converted with."""
         active = self.runtimes.active_id()
         build = parse_build_name(active) if active else None
-        active_tag = build.tag if build else None
+        return build.tag if build else None
+
+    def architectures(self, tag: str) -> list[str] | None:
+        """The models a build's converter can convert, or None if it isn't set up."""
+        manifest = _read_json(self._source_dir(tag) / MANIFEST_NAME) if _SAFE_TAG.match(tag) else None
+        if manifest is None or not self._environment_ready(manifest.get("environment")):
+            return None
+        return list(manifest.get("text_architectures") or [])
+
+    def command(self, tag: str) -> ConverterCommand:
+        manifest = _read_json(self._source_dir(tag) / MANIFEST_NAME) if _SAFE_TAG.match(tag) else None
+        if manifest is None or not self._environment_ready(manifest.get("environment")):
+            raise RuntimeNotFoundError(f"The converter for {tag} isn't set up")
+        return ConverterCommand(
+            python=environment_python(self._environment_dir(manifest["environment"])),
+            script=self._source_dir(tag) / SCRIPT_NAME,
+        )
+
+    def status(self) -> LlamaConverters:
+        active_tag = self.active_tag()
         converters = self._installed()
         return LlamaConverters(
             converter_dir=str(self.root),
@@ -376,7 +414,19 @@ class LlamaConverterService:
                 f"{needed / 1e9:.1f} GB and {free / 1e9:.1f} GB is free"
             )
 
+    def ensure_installed(self, context: JobContext, tag: str) -> dict[str, Any]:
+        """Sets a build's converter up as part of another job, such as a
+        download that needs it, reporting progress to that job."""
+        return self._install(context, tag)
+
     def _install(self, context: JobContext, tag: str) -> dict[str, Any]:
+        # A download can set up the same converter as an install job, at once.
+        with self._lock:
+            tag_lock = self._tag_locks.setdefault(tag, threading.Lock())
+        with tag_lock:
+            return self._install_once(context, tag)
+
+    def _install_once(self, context: JobContext, tag: str) -> dict[str, Any]:
         source = self._source_dir(tag)
         manifest = _read_json(source / MANIFEST_NAME)
         if manifest is not None and self._environment_ready(manifest.get("environment")):
