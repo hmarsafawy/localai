@@ -1091,6 +1091,10 @@ class LlamaRuntimeService:
                 raise RuntimeConflictError(reason)
         shutil.rmtree(path)
 
+    def active_id(self) -> str | None:
+        """The active build's id, without checking that it's still usable."""
+        return self._read_active()
+
     def _read_active(self) -> str | None:
         try:
             data = json.loads((self.root / STATE_NAME).read_text(encoding="utf-8"))

@@ -63,6 +63,36 @@ class InstalledRuntimes(BaseModel):
     update_available: RuntimeUpdates | None = None
 
 
+class LlamaConverter(BaseModel):
+    """llama.cpp's converter from Hugging Face safetensors to GGUF, at one build.
+    Every build of a tag (Vulkan, ROCm, ...) shares it."""
+
+    tag: str
+    # The commit GitHub made the source archive from.
+    commit: str | None = None
+    path: str
+    # The Python environment it runs in. Builds whose converters need the same
+    # packages share one.
+    environment: str
+    # False if its environment has gone, in which case installing it again
+    # sets that up again.
+    ready: bool = True
+    # What it can convert, as Hugging Face's `config.json` names architectures:
+    # models, and vision encoders (`--mmproj`).
+    text_architectures: list[str] = Field(default_factory=list)
+    vision_architectures: list[str] = Field(default_factory=list)
+    installed_at: datetime | None = None
+
+
+class LlamaConverters(BaseModel):
+    converter_dir: str
+    # The active runtime's tag. Null if no runtime is active.
+    active_tag: str | None = None
+    # Whether the active runtime's converter is installed and ready.
+    ready: bool = False
+    converters: list[LlamaConverter] = Field(default_factory=list)
+
+
 class AvailableBuild(BaseModel):
     id: str
     tag: str

@@ -1,18 +1,22 @@
 from anyio import to_thread
-from fastapi import APIRouter, Body, HTTPException, Query, Response, status
+from fastapi import APIRouter, Body, HTTPException, Path, Query, Response, status
 from fastapi.responses import StreamingResponse
 
 from models.jobs import JobInfo
-from models.runtime import AvailableBuilds, InstalledRuntimes
+from models.runtime import AvailableBuilds, InstalledRuntimes, LlamaConverters
 from routes.job_events import EVENT_STREAM_RESPONSES, job_events
 from schemas.runtime import (
+    TAG_PATTERN,
     VERSION_PATTERN,
     AvailableBuildsResponse,
+    ConverterInstallRequest,
     InstalledRuntimesResponse,
     JobResponse,
+    LlamaConvertersResponse,
     RuntimeActivateRequest,
     RuntimeInstallRequest,
 )
+from services.llama_converter import ConverterSpaceError, llama_converter_service as converter
 from services.llama_runtime import (
     GitHubRateLimitError,
     GitHubUnavailableError,
@@ -27,6 +31,8 @@ _NO_SUCH_JOB = "No such job. Jobs don't survive a restart of the app."
 
 
 def _map_runtime_error(error: Exception) -> HTTPException:
+    if isinstance(error, ConverterSpaceError):
+        return HTTPException(status_code=507, detail=str(error))
     if isinstance(error, RuntimeNotFoundError):
         return HTTPException(status_code=404, detail=str(error))
     if isinstance(error, RuntimeConflictError):
@@ -36,7 +42,13 @@ def _map_runtime_error(error: Exception) -> HTTPException:
     return HTTPException(status_code=502, detail=str(error))
 
 
-_RUNTIME_ERRORS = (RuntimeNotFoundError, RuntimeConflictError, GitHubRateLimitError, GitHubUnavailableError)
+_RUNTIME_ERRORS = (
+    RuntimeNotFoundError,
+    RuntimeConflictError,
+    GitHubRateLimitError,
+    GitHubUnavailableError,
+    ConverterSpaceError,
+)
 
 
 @router.get("", response_model=InstalledRuntimesResponse)
@@ -100,6 +112,38 @@ async def cancel_job(job_id: str) -> JobInfo:
     if job is None:
         raise HTTPException(status_code=404, detail=_NO_SUCH_JOB)
     return job
+
+
+@router.get("/converter", response_model=LlamaConvertersResponse)
+async def get_converters() -> LlamaConverters:
+    """llama.cpp's converter from Hugging Face safetensors to GGUF, for each
+    build it's set up for, and what each can convert. `ready` says whether the
+    active build's is set up."""
+    return await to_thread.run_sync(converter.status)
+
+
+@router.post("/converter/install", response_model=JobResponse, status_code=status.HTTP_202_ACCEPTED)
+async def install_converter(request: ConverterInstallRequest | None = Body(default=None)) -> JobInfo:
+    """Sets up the converter for a build, the active one by default, and returns
+    its job to follow at `/jobs/{job_id}/events`. It downloads the build's source
+    (about 40 MB) and, unless another build's converter already has one that
+    fits, a Python environment with PyTorch (about 1 GB)."""
+    options = request or ConverterInstallRequest()
+    try:
+        return await to_thread.run_sync(converter.start_install, options.runtime_id)
+    except _RUNTIME_ERRORS as error:
+        raise _map_runtime_error(error) from error
+
+
+@router.delete("/converter/{tag}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_converter(tag: str = Path(pattern=TAG_PATTERN, max_length=20)) -> Response:
+    """Removes a build's converter, and its Python environment unless another
+    build's converter uses it too."""
+    try:
+        await to_thread.run_sync(converter.delete, tag)
+    except _RUNTIME_ERRORS as error:
+        raise _map_runtime_error(error) from error
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.put("/active", response_model=InstalledRuntimesResponse)

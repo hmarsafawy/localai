@@ -6,8 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from models.servers import ModelServer, ServerLogs
 from schemas.downloads import OPTION_PATTERN, REPO_ID_PATTERN
-
-RUNTIME_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+from schemas.runtime import RUNTIME_ID_PATTERN
 
 
 class ServerLaunchRequest(BaseModel):

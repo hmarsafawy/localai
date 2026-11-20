@@ -30,7 +30,15 @@ async def start_download(request: ModelDownloadRequest) -> JobInfo:
     `quantization` and `vision_encoder` take an option `id` from
     `GET /models/{repo}/requirements`, or a quantization name such as `Q4_K_M`.
     `vision_encoder` can also be `none`. What's already on disk isn't fetched again,
-    and repeating a request that's still running joins that download."""
+    and repeating a request that's still running joins that download.
+
+    A repo with no GGUF files is converted: its safetensors are downloaded,
+    converted to GGUF with the active llama.cpp runtime's converter (set up
+    first if it isn't yet, about 1 GB once) and quantized, then deleted. That
+    takes more disk, RAM and time than a download; the job's
+    `details.conversion` says how much disk. `quantization` is then one of
+    BF16, F16, Q8_0, Q6_K, Q5_K_M, Q5_K_S, Q4_K_M, Q4_K_S, Q4_0, Q3_K_L,
+    Q3_K_M, Q3_K_S or Q2_K, and its vision encoder isn't converted yet."""
     try:
         return await to_thread.run_sync(service.start, request.repo_id, request.quantization, request.vision_encoder)
     except HfHubHTTPError as error:

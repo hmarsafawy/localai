@@ -19,6 +19,9 @@ class LocalModelOption(BaseModel):
     shards: int = 1
     size_bytes: int = 0
     bytes_on_disk: int = 0
+    # Made here from the repo's safetensors, which had no GGUF. Until it's
+    # done, `size_bytes` is an estimate.
+    converted: bool = False
 
 
 class LocalModel(BaseModel):
