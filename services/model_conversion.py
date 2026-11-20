@@ -8,6 +8,7 @@ its BF16 by `llama-quantize`, which is how llama.cpp's own quantizations are mad
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import sys
@@ -44,6 +45,7 @@ METADATA_BYTES = 20_000_000
 # A big model takes a while on a slow disk. One that takes longer than this has hung.
 STEP_TIMEOUT_SECONDS = 6 * 60 * 60
 CONVERTER_TAIL_LINES = 5
+TOKENIZER_CONFIG = "tokenizer_config.json"
 
 # tqdm's `Writing:  21%|██        | 56.6M/269M [00:00<00:00, 238Mbyte/s]`, in SI units.
 _WRITING = re.compile(
@@ -101,6 +103,39 @@ def parse_quantized_tensor(line: str) -> tuple[int, int, int] | None:
     return int(match["index"]), int(match["count"]), int(float(match["mib"]) * 1024**2)
 
 
+def adapt_tokenizer_config(source: Path) -> bool:
+    """Rewrites a tokenizer config saved by transformers 5 the way transformers
+    4, which the converter runs, reads it. Says whether it changed anything.
+
+    Transformers 5 names the tokenizer that loads `tokenizer.json`
+    `TokenizersBackend`, where 4 names it `PreTrainedTokenizerFast`. It also lists
+    special tokens under `extra_special_tokens`, where 4 expects a mapping, with
+    the list under `additional_special_tokens`."""
+    path = source / TOKENIZER_CONFIG
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(config, dict):
+        return False
+
+    changed = False
+    if config.get("tokenizer_class") == "TokenizersBackend":
+        config["tokenizer_class"] = "PreTrainedTokenizerFast"
+        changed = True
+    extra = config.get("extra_special_tokens")
+    if isinstance(extra, list):
+        del config["extra_special_tokens"]
+        additional = list(config.get("additional_special_tokens") or [])
+        additional += [token for token in extra if token not in additional]
+        if additional:
+            config["additional_special_tokens"] = additional
+        changed = True
+    if changed:
+        path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    return changed
+
+
 def _failure(what: str, code: int, output: list[str]) -> ConversionError:
     useful = [line.strip() for line in output if line.strip() and not _WRITING.search(line)]
     detail = " / ".join(useful[-CONVERTER_TAIL_LINES:]) or "it printed nothing"
@@ -111,6 +146,7 @@ def convert(
     context: JobContext, converter: ConverterCommand, source: Path, outfile: Path, quantization: str
 ) -> None:
     """Converts the model in `source` to `outfile`, as BF16, F16 or Q8_0."""
+    adapt_tokenizer_config(source)
     context.begin_transfer(None)
 
     def show_progress(line: str) -> None:
