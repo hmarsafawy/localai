@@ -24,6 +24,12 @@ def llama_runtimes_dir() -> Path:
     return data_dir() / "runtimes" / "llama.cpp"
 
 
+def llama_converter_dir() -> Path:
+    """llama.cpp's safetensors-to-GGUF converter for each build, and the Python
+    environments it runs in. Next to the builds, not among them."""
+    return data_dir() / "runtimes" / "llama.cpp-converter"
+
+
 def models_dir() -> Path:
     """Downloaded models, which can be moved to a bigger drive on their own. The
     default isn't `models` because `<app>/models` is the Python package."""
