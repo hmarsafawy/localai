@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from models.hf_model import HfModel, HfModelRequirements, HfPipelineInfo
+from models.hf_model import HfModel, HfModelRequirements
 
 
 class HfModelSearchRequest(BaseModel):
@@ -33,13 +33,7 @@ class HfModelSearchResponse(BaseModel):
     has_more: bool
 
 
-class HfPipelineResponse(HfPipelineInfo):
-    """Public response shape for a parsed diffusers pipeline breakdown."""
-
-    model_config = ConfigDict(from_attributes=True)
-
-
 class HfRequirementsResponse(HfModelRequirements):
-    """Public response shape for the no-model_index.json requirements breakdown."""
+    """Public response shape for what a model needs to run."""
 
     model_config = ConfigDict(from_attributes=True)

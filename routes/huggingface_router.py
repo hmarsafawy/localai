@@ -2,16 +2,15 @@ from fastapi import APIRouter, HTTPException, Query
 from anyio import to_thread
 from huggingface_hub.utils import HfHubHTTPError
 
-from models.hf_model import HfModel, HfModelRequirements, HfPipelineInfo
+from models.hf_model import HfModel, HfModelRequirements
 from schemas.hf_model import (
     HfModelResponse,
     HfModelSearchRequest,
     HfModelSearchResponse,
-    HfPipelineResponse,
     HfRequirementsResponse,
 )
 from services.hardware import hardware_service
-from services.huggingface import HuggingFaceService, ModelIndexNotFoundError
+from services.huggingface import HuggingFaceService
 from services.model_options import annotate_fit
 
 router = APIRouter()
@@ -19,9 +18,11 @@ service = HuggingFaceService()
 
 
 def _requirements_with_fit(
-    model_id: str, resolve_base_model: bool, fingerprint: bool, fit: bool
+    model_id: str, resolve_base_model: bool, fingerprint: bool, fit: bool, include_config: bool
 ) -> HfModelRequirements:
-    requirements = service.get_model_requirements(model_id, resolve_base_model, fingerprint)
+    requirements = service.get_model_requirements(
+        model_id, resolve_base_model, fingerprint, include_config=include_config
+    )
     annotate_fit(requirements, hardware_service.memory_budget() if fit else None)
     return requirements
 
@@ -58,33 +59,26 @@ async def get_model_requirements(
     resolve_base_model: bool = Query(default=True),
     fingerprint: bool = Query(default=True),
     fit: bool = Query(default=True),
+    include_config: bool = Query(default=False),
 ) -> HfModelRequirements:
-    """What a model needs to run, even without a `model_index.json`: falls back
-    through the repo's `base_model` ancestry, weight tensor-name fingerprinting,
-    and a small curated table of known pipeline families (Flux, SDXL, ...).
+    """What a model needs to run, and what each part of it is.
+
+    A diffusers pipeline is read from its `model_index.json` (or
+    `modular_model_index.json`). That gives each role's `architecture` and
+    `library`, plus the pipeline's `diffusers_version` and its other settings
+    in `pipeline_config`. Without an index, this falls back through the repo's
+    `base_model` ancestry, weight tensor-name fingerprinting, and a small
+    curated table of known pipeline families (Flux, SDXL, ...).
 
     Each role's `options` lists what can be downloaded for it, one per
     quantization, precision or variant. With `fit`, LLM options are also rated
-    against this machine's free memory and one is marked as recommended."""
+    against this machine's free memory and one is marked as recommended. With
+    `include_config`, each pipeline component's own config is added as its
+    role's `config`. That downloads one file per component, so it's off by default."""
     try:
         return await to_thread.run_sync(
-            _requirements_with_fit, model_id, resolve_base_model, fingerprint, fit
+            _requirements_with_fit, model_id, resolve_base_model, fingerprint, fit, include_config
         )
-    except HfHubHTTPError as error:
-        raise map_hf_error(error) from error
-
-
-@router.get("/{model_id:path}/pipeline", response_model=HfPipelineResponse)
-async def get_model_pipeline(model_id: str, include_config: bool = Query(default=True)) -> HfPipelineInfo:
-    """Parse the repo's `model_index.json` (or `modular_model_index.json`) and report what the pipeline needs
-    (text encoder, VAE, scheduler, ...) plus whether each piece is actually in the repo."""
-    try:
-        return await to_thread.run_sync(service.get_pipeline_requirements, model_id, include_config)
-    except ModelIndexNotFoundError as error:
-        raise HTTPException(
-            status_code=404,
-            detail="Repository has no model_index.json or modular_model_index.json (not a diffusers pipeline)",
-        ) from error
     except HfHubHTTPError as error:
         raise map_hf_error(error) from error
 

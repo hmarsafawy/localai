@@ -182,7 +182,7 @@ class HuggingFaceService:
         return HfModel.model_validate(model_data)
 
     def get_pipeline_requirements(
-        self, model_id: str, include_config: bool = True, info: Any = None
+        self, model_id: str, include_config: bool = False, info: Any = None
     ) -> HfPipelineInfo:
         """Parse a diffusers `model_index.json` (or a modular pipeline's
         `modular_model_index.json`) and match each declared component against
@@ -239,12 +239,6 @@ class HuggingFaceService:
                 ]
             external_repo = source_repo if source_repo not in (None, resolved_id) else None
 
-            config_data = (
-                self._download_component_config(source_repo, subfolder, files)
-                if include_config and source_repo is not None
-                else None
-            )
-
             components.append(
                 HfPipelineComponent(
                     name=key,
@@ -255,12 +249,22 @@ class HuggingFaceService:
                     repo_id=external_repo,
                     files=files,
                     formats=self._formats_for_files(files),
-                    config=config_data,
                 )
             )
 
             if required and not files:
                 missing_components.append(key)
+
+        if include_config:
+            # A component with no source repo has no files, so nothing is fetched for it.
+            configs = self._run_parallel(
+                lambda component: self._download_component_config(
+                    component.repo_id or resolved_id, component.subfolder, component.files
+                ),
+                components,
+            )
+            for component, config in zip(components, configs):
+                component.config = config
 
         return HfPipelineInfo(
             model_id=resolved_id,
@@ -360,17 +364,20 @@ class HuggingFaceService:
         resolve_base_model: bool = True,
         fingerprint: bool = True,
         max_fingerprint_files: int = MAX_FINGERPRINT_FILES,
+        include_config: bool = False,
     ) -> HfModelRequirements:
-        """Best-effort answer to "what does this model need to run" for repos that
-        don't ship a pipeline index (GGUF quantizations, bare component repos,
-        single-file checkpoints, ...). Falls back through the repo's `base_model`
+        """What a model needs to run. A repo's own pipeline index answers it
+        directly. Without one, it falls back through the repo's `base_model`
         ancestry, then the per-subfolder configs of a diffusers-layout repo, then
         weight tensor-name fingerprinting plus a small curated table of known
         pipeline families. Each role also lists the options it can be downloaded
-        as (one per quantization, precision or variant)."""
+        as (one per quantization, precision or variant).
+
+        `include_config` adds each pipeline component's own config, at the cost
+        of downloading one file per component."""
         info = self.api.model_info(model_id, files_metadata=True)
         requirements = self._resolve_requirements(
-            model_id, info, resolve_base_model, fingerprint, max_fingerprint_files
+            model_id, info, resolve_base_model, fingerprint, max_fingerprint_files, include_config
         )
         attach_options(
             requirements,
@@ -404,9 +411,10 @@ class HuggingFaceService:
         resolve_base_model: bool,
         fingerprint: bool,
         max_fingerprint_files: int,
+        include_config: bool = False,
     ) -> HfModelRequirements:
         try:
-            pipeline = self.get_pipeline_requirements(model_id, include_config=False, info=info)
+            pipeline = self.get_pipeline_requirements(model_id, include_config=include_config, info=info)
             return self._requirements_from_direct_pipeline(pipeline)
         except ModelIndexNotFoundError:
             pass
@@ -431,7 +439,9 @@ class HuggingFaceService:
         resolved_pipeline: HfPipelineInfo | None = None
         resolved_from: str | None = None
         if resolve_base_model:
-            resolved_pipeline, resolved_from, chain_notes = self._resolve_from_base_model(model_id, info)
+            resolved_pipeline, resolved_from, chain_notes = self._resolve_from_base_model(
+                model_id, info, include_config=include_config
+            )
             notes.extend(chain_notes)
 
         if resolved_pipeline is not None:
@@ -442,7 +452,7 @@ class HuggingFaceService:
         # The repo's own component configs say exactly what each part is, which
         # beats guessing a family from its name - "flux" in a repo id says
         # nothing about which generation's text encoders it uses.
-        self_described = self._pipeline_from_component_configs(model_id, info)
+        self_described = self._pipeline_from_component_configs(model_id, info, include_config)
         if self_described is not None:
             notes.append("no pipeline index; components were read from each subfolder's own config")
             return self._requirements_from_ancestor_pipeline(
@@ -466,6 +476,7 @@ class HuggingFaceService:
                 role = HfRequirementRole(
                     role=component.name,
                     architecture=component.class_name,
+                    library=component.library,
                     required=component.required,
                     present=False,
                     source="external",
@@ -476,6 +487,7 @@ class HuggingFaceService:
                             note="the pipeline index loads this component from another repo",
                         )
                     ],
+                    config=component.config,
                 )
                 roles.append(role)
                 if self._is_text_encoder_role(component.name) and files:
@@ -489,12 +501,14 @@ class HuggingFaceService:
             role = HfRequirementRole(
                 role=component.name,
                 architecture=component.class_name,
+                library=component.library,
                 required=component.required,
                 present=present,
                 source="repo",
                 subfolder=component.subfolder or None,
                 files=files,
                 sources=sources,
+                config=component.config,
             )
             roles.append(role)
             if self._is_text_encoder_role(component.name) and present:
@@ -505,6 +519,8 @@ class HuggingFaceService:
             model_id=pipeline.model_id,
             family=family.name if family else None,
             pipeline_class=pipeline.class_name,
+            diffusers_version=pipeline.diffusers_version,
+            pipeline_config=pipeline.extra_config,
             resolved_from=None,
             roles=roles,
             notes=notes or [],
@@ -586,7 +602,9 @@ class HuggingFaceService:
             components=components,
         )
 
-    def _pipeline_from_component_configs(self, model_id: str, info: Any) -> HfPipelineInfo | None:
+    def _pipeline_from_component_configs(
+        self, model_id: str, info: Any, include_config: bool = False
+    ) -> HfPipelineInfo | None:
         """For a repo laid out the diffusers way (`transformer/`, `vae/`,
         `text_encoder/`, ...) that just never wrote a pipeline index: each
         subfolder's own config still names its class, which is all the index
@@ -618,6 +636,7 @@ class HuggingFaceService:
                     subfolder=subfolder,
                     files=files,
                     formats=self._formats_for_files(files),
+                    config=config if include_config else None,
                 )
             )
 
@@ -638,7 +657,11 @@ class HuggingFaceService:
         return grouped
 
     def _resolve_from_base_model(
-        self, model_id: str, info: Any, max_depth: int = MAX_BASE_MODEL_CHAIN_DEPTH
+        self,
+        model_id: str,
+        info: Any,
+        max_depth: int = MAX_BASE_MODEL_CHAIN_DEPTH,
+        include_config: bool = False,
     ) -> tuple[HfPipelineInfo | None, str | None, list[str]]:
         notes: list[str] = []
         visited = {model_id}
@@ -655,7 +678,9 @@ class HuggingFaceService:
 
                 try:
                     candidate_info = self.api.model_info(candidate, files_metadata=True)
-                    pipeline = self.get_pipeline_requirements(candidate, include_config=False, info=candidate_info)
+                    pipeline = self.get_pipeline_requirements(
+                        candidate, include_config=include_config, info=candidate_info
+                    )
                     return pipeline, candidate, notes
                 except ModelIndexNotFoundError:
                     pass
@@ -775,12 +800,14 @@ class HuggingFaceService:
                 role = HfRequirementRole(
                     role=component.name,
                     architecture=component.class_name,
+                    library=component.library,
                     required=component.required,
                     present=True,
                     source="repo" if own_files else "fingerprint",
                     confidence=confidence,
                     subfolder=component.name if only_subfolder else None,
                     files=[name[len(prefix) :] for name in files] if only_subfolder else files,
+                    config=component.config,
                 )
                 roles.append(role)
                 if self._is_text_encoder_role(component.name):
@@ -837,6 +864,7 @@ class HuggingFaceService:
             role = HfRequirementRole(
                 role=component.name,
                 architecture=component.class_name,
+                library=component.library,
                 required=component.required,
                 present=False,
                 source=(
@@ -844,6 +872,7 @@ class HuggingFaceService:
                 ),
                 files=[],
                 sources=sources,
+                config=component.config,
             )
             roles.append(role)
             if self._is_text_encoder_role(component.name) and component.files:
@@ -868,6 +897,8 @@ class HuggingFaceService:
             model_id=model_id,
             family=family.name if family else None,
             pipeline_class=pipeline.class_name,
+            diffusers_version=pipeline.diffusers_version,
+            pipeline_config=pipeline.extra_config,
             resolved_from=resolved_from,
             roles=roles,
             unidentified_files=unidentified,
