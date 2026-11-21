@@ -128,6 +128,8 @@ class HfRequirementRole(BaseModel):
 
     role: str
     architecture: str | None = None
+    # What loads it, `diffusers` or `transformers`, as the pipeline index says.
+    library: str | None = None
     required: bool = True
     present: bool = False
     source: str = "repo"  # "repo" | "external" | "base_model" | "fingerprint" | "registry"
@@ -143,6 +145,9 @@ class HfRequirementRole(BaseModel):
     # How `options` may be chosen from: "one" | "optional_one" | "any" | "all".
     selection: str = "all"
     options: list[HfRoleOption] = Field(default_factory=list)
+    # The component's own config (`config.json`, `scheduler_config.json`, ...),
+    # from the pipeline it was resolved through. Only fetched when asked for.
+    config: dict[str, Any] | None = None
 
 
 class HfModelRequirements(BaseModel):
@@ -155,6 +160,10 @@ class HfModelRequirements(BaseModel):
     model_id: str
     family: str | None = None
     pipeline_class: str | None = None
+    diffusers_version: str | None = None
+    # The pipeline index's own settings that aren't components, such as
+    # `force_zeros_for_empty_prompt`.
+    pipeline_config: dict[str, Any] = Field(default_factory=dict)
     resolved_from: str | None = None
     roles: list[HfRequirementRole] = Field(default_factory=list)
     unidentified_files: list[str] = Field(default_factory=list)
