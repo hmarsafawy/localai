@@ -1,0 +1,9 @@
+-r requirements.txt
+pytest>=9.0,<10.0
+# How much of the code the tests run.
+pytest-cov>=7.0,<8.0
+# Runs the tests in a new order each time, so one that only passes after
+# another has run gets caught. The order is printed, to run it again.
+pytest-randomly>=5.0,<6.0
+# Exact, so a new release's rules can't fail a change that didn't touch them.
+ruff==0.17.6

@@ -4,8 +4,9 @@ import json
 import os
 import re
 from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
 from dotenv import load_dotenv
 from huggingface_hub import HfApi, hf_hub_download
@@ -428,8 +429,10 @@ class HuggingFaceService:
             return self._requirements_from_direct_pipeline(
                 coarse,
                 notes=[
-                    f"{model_id} is gated and its license hasn't been accepted for this token; used its "
-                    "public file listing, so component classes and optional components are unknown"
+                    (
+                        f"{model_id} is gated and its license hasn't been accepted for this token; used its "
+                        "public file listing, so component classes and optional components are unknown"
+                    )
                 ],
             )
 

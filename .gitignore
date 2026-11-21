@@ -225,10 +225,6 @@ __marimo__/
 # Installed llama.cpp builds (about 1 GB each)
 /runtimes/
 
-/tests/
-/pytest.ini
-/requirements-dev.txt
-
 /model-files/
 
 # llama-server output, one file per launch

@@ -1,0 +1,12 @@
+[run]
+branch = True
+source = .
+omit =
+    tests/*
+    runtimes/*
+
+[report]
+skip_empty = True
+# 74% on Windows and on Linux when this was set. Below this, CI fails: a lot
+# of new code went in without tests.
+fail_under = 70

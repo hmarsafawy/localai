@@ -363,6 +363,7 @@ def _run_server_command(runtime_dir: Path, backend: str, flag: str) -> tuple[int
         completed = subprocess.run(
             [str(binary), flag],
             capture_output=True,
+            check=False,
             timeout=VERIFY_TIMEOUT_SECONDS,
             cwd=runtime_dir,
             env=runtime_environment(runtime_dir, backend),

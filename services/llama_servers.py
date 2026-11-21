@@ -197,6 +197,7 @@ def run_fit_params(runtime: LaunchableRuntime, arguments: list[str]) -> str | No
         completed = subprocess.run(
             [str(binary), *arguments],
             capture_output=True,
+            check=False,
             stdin=subprocess.DEVNULL,
             timeout=FIT_TIMEOUT_SECONDS,
             cwd=runtime.directory,
@@ -312,6 +313,12 @@ def port_is_free(port: int) -> bool:
             if family == socket.AF_INET6:
                 # Both stacks, to see a listener on [::] that takes IPv4 as well.
                 probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            if sys.platform != "win32":
+                # Elsewhere, a port whose server has just stopped can't be bound
+                # for a minute without this (TIME_WAIT), though llama-server,
+                # which sets it too, could. A listener still blocks the bind. On
+                # Windows it would let the bind take a port that's in use.
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind((address, port))
             except OSError:

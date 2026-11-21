@@ -1,0 +1,54 @@
+# Everything end to end, conversion included, against the newest llama.cpp and
+# the models on Hugging Face as they are now. Those change even when this code
+# doesn't, so this runs every week, and on pull requests that touch conversion.
+name: Weekly end-to-end
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"  # Mondays, 04:00 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - services/llama_converter.py
+      - services/model_conversion.py
+      - services/model_downloads.py
+      - tests/e2e/**
+      - requirements.txt
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: End-to-end with conversion (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -m e2e -v -ra
+        env:
+          LOCALAI_E2E_DATA_DIR: ${{ runner.temp }}/localai-e2e
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Keep the logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/localai-e2e/app.log
+            ${{ runner.temp }}/localai-e2e/logs/
+          if-no-files-found: ignore

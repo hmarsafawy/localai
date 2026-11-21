@@ -162,9 +162,8 @@ def _split_quantization(path: str) -> tuple[str | None, str]:
     """(quantization, the stem without it). The last match wins: names put the
     model first, and that's where a false match could come from."""
     stem = _weight_stem(path)
-    match = None
-    for match in _QUANT_TOKEN.finditer(stem):
-        pass
+    matches = list(_QUANT_TOKEN.finditer(stem))
+    match = matches[-1] if matches else None
     if match is None:
         folder = path.rpartition("/")[0].rsplit("/", 1)[-1]
         if folder and _QUANT_ONLY.fullmatch(folder):

@@ -147,6 +147,7 @@ def _run(args: list[str], timeout: float = 15) -> str | None:
         completed = subprocess.run(
             args,
             capture_output=True,
+            check=False,
             timeout=timeout,
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
