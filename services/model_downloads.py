@@ -1049,17 +1049,20 @@ class ModelDownloadService:
             self._check_runnable(model.repo_id, vision, downloading)
         return LocalSelection(repo_id=model.repo_id, model=chosen, vision=vision)
 
-    def _find_local(self, repo_id: str) -> LocalModel | None:
-        """Matched however it's capitalised, as it is on Hugging Face."""
+    def _existing_folder(self, repo_id: str) -> Path | None:
+        """The repo's folder, matched however it's capitalised, as it is on
+        Hugging Face. Windows ignores case anyway; Linux doesn't."""
         wanted = repo_folder_name(repo_id).casefold()
         if not self.root.is_dir():
             return None
-        for folder in self.root.iterdir():
-            if folder.is_dir() and folder.name.casefold() == wanted:
-                manifest = _read_manifest(folder)
-                if manifest is not None:
-                    return self._local_model(folder, manifest)
-        return None
+        return next(
+            (folder for folder in self.root.iterdir() if folder.is_dir() and folder.name.casefold() == wanted), None
+        )
+
+    def _find_local(self, repo_id: str) -> LocalModel | None:
+        folder = self._existing_folder(repo_id)
+        manifest = _read_manifest(folder) if folder else None
+        return self._local_model(folder, manifest) if folder and manifest is not None else None
 
     def _downloading_options(self, repo_id: str) -> set[str | None]:
         return {
@@ -1128,9 +1131,9 @@ class ModelDownloadService:
     def delete(self, repo_id: str, quantization: str | None = None, vision_encoder: str | None = None) -> None:
         """Removes a repo's files, or only the options named, along with anything
         half downloaded. A running or queued download of the repo blocks this."""
-        folder = self._folder(repo_id)
         with self._lock:
-            if not folder.is_dir():
+            folder = self._existing_folder(repo_id)
+            if folder is None:
                 raise LocalModelNotFoundError(f"{repo_id} isn't in the library")
             if any(
                 job.status in ACTIVE_STATUSES and job.details.get("repo_id", "").casefold() == repo_id.casefold()

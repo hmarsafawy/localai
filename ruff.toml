@@ -1,0 +1,18 @@
+target-version = "py312"
+line-length = 120
+
+[lint]
+# Mistakes rather than style: syntax errors, undefined or unused names, likely
+# bugs (bugbear), outdated syntax, and import order.
+select = ["E4", "E7", "E9", "F", "B", "I", "UP", "ISC", "PLE", "PLW"]
+# zip() without strict= is how it's meant here: the sides are the same length.
+# A module-level singleton set on first use is what `global` is for here.
+ignore = ["B905", "PLW0603"]
+
+[lint.flake8-bugbear]
+# FastAPI's way of declaring a parameter, not a shared mutable default.
+extend-immutable-calls = ["fastapi.Body", "fastapi.Depends", "fastapi.Path", "fastapi.Query"]
+
+[lint.isort]
+# Keep `from x import A, b as c` on one line, as the code already does.
+combine-as-imports = true

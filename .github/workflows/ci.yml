@@ -1,0 +1,90 @@
+# Checks every pull request, and main after each merge.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push to a pull request cancels the run still going for the one before.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install "$(grep '^ruff' requirements-dev.txt)"
+      # Findings show up on the pull request's changed lines.
+      - run: ruff check . --output-format github
+
+  tests:
+    name: Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is where the app runs today; Linux is where a shared server would.
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      # In a random order (its seed is printed, to repeat it), measuring coverage.
+      - run: pytest -ra --cov --cov-report=term-missing:skip-covered
+      - name: Coverage summary
+        if: always()
+        shell: bash
+        run: |
+          echo "### Coverage on ${{ matrix.os }}" >> "$GITHUB_STEP_SUMMARY"
+          coverage report --format=markdown --skip-covered >> "$GITHUB_STEP_SUMMARY" || true
+
+  e2e:
+    name: End-to-end (${{ matrix.os }})
+    # Only once the fast checks pass, so a broken change fails in minutes.
+    needs: tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -m "e2e and not conversion" -v -ra
+        env:
+          LOCALAI_E2E_DATA_DIR: ${{ runner.temp }}/localai-e2e
+          # GitHub allows 60 unauthenticated calls an hour, shared with whoever
+          # else the runner's address belongs to; this token gets 1,000.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Keep the logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/localai-e2e/app.log
+            ${{ runner.temp }}/localai-e2e/logs/
+          if-no-files-found: ignore

@@ -1,5 +1,5 @@
-from fastapi import APIRouter, HTTPException, Query
 from anyio import to_thread
+from fastapi import APIRouter, HTTPException, Query
 from huggingface_hub.utils import HfHubHTTPError
 
 from models.hf_model import HfModel, HfModelRequirements
