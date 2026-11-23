@@ -20,8 +20,9 @@ from huggingface_hub import HfApi, hf_hub_url
 
 from schemas.hf_model import HfModelSearchRequest
 from services.huggingface import HuggingFaceService
-from services.model_conversion import text_architectures
+from services.model_conversion import text_architectures, vision_architecture
 from services.model_downloads import _converter_weights, _gguf_files, _parameter_count
+from services.tensor_signatures import is_vision_key
 from services.weight_headers import read_gguf_metadata
 
 from ..e2e.helpers import GGUF_QUANTIZATION, GGUF_REPO, SAFETENSORS_REPO
@@ -32,6 +33,8 @@ pytestmark = pytest.mark.contract
 GGUF_FILE = f"SmolLM2-135M-Instruct-{GGUF_QUANTIZATION}.gguf"
 # Anyone can see it, but its files need a license accepted first.
 GATED_REPO = "meta-llama/Llama-3.2-1B"
+# A small vision model with only safetensors, whose vision encoder is converted too.
+VISION_REPO = "HuggingFaceTB/SmolVLM-256M-Instruct"
 SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -81,18 +84,42 @@ def test_the_app_finds_every_gguf_with_its_size_and_checksum(gguf_info: Any) -> 
         assert SHA256.fullmatch(file.sha256 or ""), f"{file.path} would be downloaded without a check"
 
 
+def config_of(http: httpx.Client, repo_id: str, revision: str) -> dict[str, Any]:
+    response = http.get(hf_hub_url(repo_id, "config.json", revision=revision), follow_redirects=True)
+    assert response.status_code == 200, response.status_code
+    return response.json()
+
+
 def test_a_safetensors_repo_says_what_converting_it_needs(api: HfApi, http: httpx.Client) -> None:
     info = api.model_info(SAFETENSORS_REPO, files_metadata=True)
     # What picks the converter, and what the size estimate before converting uses.
-    config = http.get(hf_hub_url(SAFETENSORS_REPO, "config.json", revision=info.sha), follow_redirects=True)
-    assert config.status_code == 200, config.status_code
-    assert text_architectures(config.json()) == ["LlamaForCausalLM"]
+    config = config_of(http, SAFETENSORS_REPO, info.sha)
+    assert text_architectures(config) == ["LlamaForCausalLM"]
+    assert vision_architecture(config) is None
     assert (_parameter_count(info) or 0) > 100_000_000
     weights = _converter_weights(info)
     assert weights is not None and weights.files == ["model.safetensors"]
     assert weights.size_bytes > 100 * 1024**2
     [sibling] = [sibling for sibling in info.siblings if sibling.rfilename == "model.safetensors"]
     assert SHA256.fullmatch(sibling.lfs.sha256 or "")
+
+
+def test_a_vision_model_says_what_its_vision_encoder_is(api: HfApi, http: httpx.Client) -> None:
+    info = api.model_info(VISION_REPO, files_metadata=True)
+    # The Hub's summary of config.json leaves out what the converter goes by.
+    assert "text_config" not in (info.config or {}) and "vision_config" not in (info.config or {})
+    config = config_of(http, VISION_REPO, info.sha)
+    assert text_architectures(config) == ["VLlama3ForCausalLM", "Idefics3ForConditionalGeneration"]
+    assert vision_architecture(config) == "Idefics3ForConditionalGeneration"
+    # The vision encoder's size, and what's left for the text model, come from the headers.
+    metadata = api.get_safetensors_metadata(VISION_REPO, revision=info.sha)
+    vision = sum(
+        tensor.parameter_count
+        for file in metadata.files_metadata.values()
+        for name, tensor in file.tensors.items()
+        if is_vision_key(name)
+    )
+    assert 50_000_000 < vision < (_parameter_count(info) or 0) / 2
 
 
 def test_a_download_can_resume_and_ends_at_the_listed_size(gguf_info: Any, http: httpx.Client) -> None:

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import socket
+import struct
 import subprocess
 import time
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +24,9 @@ GGUF_QUANTIZATION = "Q4_K_M"
 # The same model as safetensors only, about 270 MB, which the app converts.
 SAFETENSORS_REPO = "HuggingFaceTB/SmolLM2-135M-Instruct"
 CONVERTED_QUANTIZATION = "Q8_0"
+# A vision model with safetensors only, about 520 MB, whose vision encoder is
+# converted to an mmproj along with it. Small, but it tells colours apart.
+VISION_REPO = "HuggingFaceTB/SmolVLM-256M-Instruct"
 # A small context keeps the memory it needs, and so its load time, down.
 CONTEXT_SIZE = 2048
 
@@ -133,5 +139,26 @@ def chat_body(model: str, question: str, **extra: Any) -> dict[str, Any]:
 
 def chat(client: httpx.Client, model: str, question: str) -> str:
     response = client.post("/v1/chat/completions", headers=AUTH, json=chat_body(model, question))
+    assert response.status_code == 200, response.text
+    return response.json()["choices"][0]["message"]["content"]
+
+
+def solid_png(rgb: tuple[int, int, int], size: int = 256) -> bytes:
+    """A PNG of one colour, made without an imaging library."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    row = b"\x00" + bytes(rgb) * size  # Each row starts with its filter type, none.
+    header = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)  # 8-bit RGB
+    signature = b"\x89PNG\r\n\x1a\n"
+    return signature + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(row * size)) + chunk(b"IEND", b"")
+
+
+def chat_about_image(client: httpx.Client, model: str, png: bytes, question: str) -> str:
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(png).decode()}}
+    body = chat_body(model, question)
+    body["messages"] = [{"role": "user", "content": [image, {"type": "text", "text": question}]}]
+    response = client.post("/v1/chat/completions", headers=AUTH, json=body)
     assert response.status_code == 200, response.text
     return response.json()["choices"][0]["message"]["content"]

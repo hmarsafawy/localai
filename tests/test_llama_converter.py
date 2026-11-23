@@ -342,6 +342,10 @@ def test_installing_sets_up_the_converter_for_the_active_build(
     assert converter.tag == "b100" and converter.ready
     assert converter.text_architectures == ["LlamaForCausalLM", "Qwen3ForCausalLM"]
     assert converter.vision_architectures == ["Qwen2VLForConditionalGeneration"]
+    # What downloads ask before converting a model, or its vision encoder.
+    assert service.architectures("b100") == ["LlamaForCausalLM", "Qwen3ForCausalLM"]
+    assert service.vision_architectures("b100") == ["Qwen2VLForConditionalGeneration"]
+    assert service.vision_architectures("b99") is None
     assert (Path(converter.path) / "convert_hf_to_gguf.py").is_file()
     # Nothing is left behind but the converter and its environment.
     assert sorted(path.name for path in (service.root / SOURCES_DIR).iterdir()) == ["b100"]
