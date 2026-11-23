@@ -333,16 +333,26 @@ class LlamaConverterService:
         build = parse_build_name(active) if active else None
         return build.tag if build else None
 
-    def architectures(self, tag: str) -> list[str] | None:
-        """The models a build's converter can convert, or None if it isn't set up."""
+    def _ready_manifest(self, tag: str) -> dict[str, Any] | None:
         manifest = _read_json(self._source_dir(tag) / MANIFEST_NAME) if _SAFE_TAG.match(tag) else None
         if manifest is None or not self._environment_ready(manifest.get("environment")):
             return None
-        return list(manifest.get("text_architectures") or [])
+        return manifest
+
+    def architectures(self, tag: str) -> list[str] | None:
+        """The models a build's converter can convert, or None if it isn't set up."""
+        manifest = self._ready_manifest(tag)
+        return None if manifest is None else list(manifest.get("text_architectures") or [])
+
+    def vision_architectures(self, tag: str) -> list[str] | None:
+        """The models whose vision encoder a build's converter can convert to an
+        mmproj, or None if it isn't set up."""
+        manifest = self._ready_manifest(tag)
+        return None if manifest is None else list(manifest.get("vision_architectures") or [])
 
     def command(self, tag: str) -> ConverterCommand:
-        manifest = _read_json(self._source_dir(tag) / MANIFEST_NAME) if _SAFE_TAG.match(tag) else None
-        if manifest is None or not self._environment_ready(manifest.get("environment")):
+        manifest = self._ready_manifest(tag)
+        if manifest is None:
             raise RuntimeNotFoundError(f"The converter for {tag} isn't set up")
         return ConverterCommand(
             python=environment_python(self._environment_dir(manifest["environment"])),
@@ -391,7 +401,7 @@ class LlamaConverterService:
         build = parse_build_name(runtime.id)
         if build is None:
             raise RuntimeNotFoundError(f"No installed runtime called {runtime.id}")
-        if not self._converter_ready(build.tag):
+        if self._ready_manifest(build.tag) is None:
             has_environment = any(self._environment_ready(converter.environment) for converter in self._installed())
             self._check_space(SOURCE_SPACE_BYTES + (0 if has_environment else ENVIRONMENT_SPACE_BYTES))
 
@@ -400,10 +410,6 @@ class LlamaConverterService:
 
         details = {"tag": build.tag, "runtime_id": runtime.id}
         return self.jobs.submit(JOB_KIND, f"converter:{build.tag}", work, details=details)
-
-    def _converter_ready(self, tag: str) -> bool:
-        manifest = _read_json(self._source_dir(tag) / MANIFEST_NAME)
-        return manifest is not None and self._environment_ready(manifest.get("environment"))
 
     def _check_space(self, needed: int) -> None:
         self.root.mkdir(parents=True, exist_ok=True)

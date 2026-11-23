@@ -7,7 +7,8 @@ worked out from the disk rather than trusted from a record of it.
 
 A repo with no GGUF files is converted instead: its safetensors are downloaded
 into a hidden folder, converted to GGUF by llama.cpp's converter for the active
-runtime, and quantized. Only the GGUF is kept.
+runtime, and quantized. A vision model's vision encoder is converted from the
+same download. Only the GGUFs are kept.
 """
 
 from __future__ import annotations
@@ -18,12 +19,13 @@ import os
 import shutil
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 import httpx
 from huggingface_hub import hf_hub_url
+from huggingface_hub.errors import NotASafetensorsRepoError, SafetensorsParsingError
 from huggingface_hub.utils import HfHubHTTPError, HFValidationError
 
 from models.downloads import LocalModel, LocalModelOption, ModelLibrary
@@ -32,16 +34,21 @@ from models.jobs import JobInfo
 from services.hardware import hardware_service
 from services.huggingface import HuggingFaceService
 from services.jobs import ACTIVE_STATUSES, JobContext, JobStore, download_file
-from services.llama_converter import LlamaConverterService, llama_converter_service
+from services.llama_converter import ConverterCommand, LlamaConverterService, llama_converter_service
 from services.llama_runtime import LaunchableRuntime, RuntimeConflictError, RuntimeNotFoundError, parse_build_name
 from services.model_conversion import (
     CONVERTER_OUTTYPES,
     INTERMEDIATE,
+    VISION_DEFAULT,
+    ConversionError,
     conversion_options,
     convert,
     estimated_size_bytes,
     gguf_name,
     quantize,
+    text_architectures,
+    vision_architecture,
+    vision_conversion_options,
 )
 from services.model_options import (
     MemoryBudget,
@@ -53,6 +60,7 @@ from services.model_options import (
     vision_encoder_options,
 )
 from services.settings import TEXT_GENERATION_TASK, text_models_dir
+from services.tensor_signatures import is_vision_key
 
 logger = logging.getLogger(__name__)
 
@@ -75,10 +83,11 @@ HUB_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 # Where a conversion's download and its BF16 go, inside the model's folder.
 SOURCE_DIR = ".source"
 SOURCE_RECORD = "localai-source.json"
-# What the converter reads besides the weights: the config, the tokenizer and
-# the chat template. Never code: the converter loads tokenizers in a way that
-# would run a repo's own.
+# What the converter reads besides the weights: the config, the tokenizer, the
+# chat template and how images are prepared. Never code: the converter loads
+# tokenizers in a way that would run a repo's own.
 SOURCE_EXTENSIONS = (".json", ".model", ".txt", ".jinja", ".tiktoken")
+CONFIG_FILE = "config.json"
 
 
 class ModelDownloadRequestError(Exception):
@@ -147,12 +156,21 @@ class _ConversionPlan:
     repo_id: str
     revision: str | None
     architecture: str
+    # What the converter may convert the text model as, the likelier first.
+    # Which it is only shows once the converter is set up.
+    architectures: tuple[str, ...]
+    # The text model's, without its vision encoder.
     parameters: int
     files: tuple[_RepoFile, ...]
     target: HfRoleOption
     runtime: LaunchableRuntime
     tag: str
     notes: tuple[str, ...]
+    vision: HfRoleOption | None = None
+    vision_architecture: str | None = None
+    vision_parameters: int | None = None
+    # Asked for by name, rather than taken by `auto`, so it's not done without.
+    vision_chosen: bool = False
 
     @property
     def source_bytes(self) -> int:
@@ -164,13 +182,18 @@ class _ConversionPlan:
         return self.target.id in CONVERTER_OUTTYPES
 
     @property
-    def disk_bytes(self) -> int:
-        """The most it takes at once. The download goes once it's converted, so
-        that's the download and the BF16, or the BF16 and the quantization."""
+    def text_disk_bytes(self) -> int:
+        """The most converting the text model takes at once. The download goes
+        once it's converted, so that's the download and the BF16, or the BF16
+        and the quantization."""
         if self.direct:
             return self.source_bytes + (self.target.size_bytes or 0)
         intermediate = estimated_size_bytes(self.parameters, INTERMEDIATE)
         return max(self.source_bytes + intermediate, intermediate + (self.target.size_bytes or 0))
+
+    @property
+    def vision_bytes(self) -> int:
+        return (self.vision.size_bytes or 0) if self.vision else 0
 
 
 # (repo id, the (role, option id) pairs being deleted or None for all) -> why not.
@@ -247,13 +270,12 @@ def _converter_weights(info: Any) -> HfRoleOption | None:
     )
 
 
-def _architecture(info: Any) -> str | None:
-    """What the model is, as its `config.json` names it (`LlamaForCausalLM`)."""
-    config = getattr(info, "config", None) or {}
-    architectures = config.get("architectures") if isinstance(config, dict) else None
-    if isinstance(architectures, list) and architectures and isinstance(architectures[0], str):
-        return architectures[0]
-    return None
+def _convertible_as(architectures: list[str] | tuple[str, ...], supported: list[str] | None) -> str | None:
+    """Which of `architectures` the converter converts the text model as, or
+    None if it can't. Until it's set up and can say, the likelier one."""
+    if supported is None:
+        return architectures[0] if architectures else None
+    return next((name for name in architectures if name in supported), None)
 
 
 def _parameter_count(info: Any) -> int | None:
@@ -322,6 +344,15 @@ def _write_manifest(folder: Path, manifest: dict[str, Any]) -> None:
     temporary = folder / f"{MANIFEST_NAME}.tmp"
     temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     os.replace(temporary, folder / MANIFEST_NAME)
+
+
+def _upsert_option(manifest: dict[str, Any], record: dict[str, Any]) -> None:
+    """Puts an option's record in the manifest, in place of one for the same option."""
+    for index, existing in enumerate(manifest["options"]):
+        if existing.get("role") == record["role"] and existing.get("id") == record["id"]:
+            manifest["options"][index] = record
+            return
+    manifest["options"].append(record)
 
 
 def _is_complete(folder: Path, path: str, entry: dict[str, Any] | None) -> bool:
@@ -440,10 +471,14 @@ class ModelDownloadService:
     def _check_access(self, repo_id: str, revision: str | None, path: str) -> None:
         response = self.client.head(hf_hub_url(repo_id, path, revision=revision), follow_redirects=False)
         if response.status_code in (401, 403):
-            raise ModelAccessError(
-                f"{repo_id} is gated. Accept its license at https://huggingface.co/{repo_id}, "
-                "then make sure HF_TOKEN in .env is a token from that account."
-            )
+            raise self._gated(repo_id)
+
+    @staticmethod
+    def _gated(repo_id: str) -> ModelAccessError:
+        return ModelAccessError(
+            f"{repo_id} is gated. Accept its license at https://huggingface.co/{repo_id}, "
+            "then make sure HF_TOKEN in .env is a token from that account."
+        )
 
     @staticmethod
     def _not_a_text_model(repo_id: str, requirements: HfModelRequirements) -> str:
@@ -543,16 +578,12 @@ class ModelDownloadService:
         resolved_id = getattr(info, "id", None) or repo_id
         revision = getattr(info, "sha", None)
         requirements = self.hf.get_model_requirements(resolved_id)
-        weights = self._safetensors_weights(resolved_id, info, requirements)
+        weights, has_vision_weights = self._safetensors_weights(resolved_id, info, requirements)
         files = _source_files(resolved_id, info, weights)
         self._check_access(resolved_id, revision, weights.files[0])
-        if vision_encoder.casefold() not in (AUTO, NONE):
-            raise ModelDownloadRequestError(
-                f"{resolved_id} has no GGUF vision encoder, and converting one isn't supported yet. "
-                "Leave vision_encoder as auto or none."
-            )
-        architecture = _architecture(info)
-        if architecture is None:
+        config = self._config(resolved_id, revision, info)
+        architectures = text_architectures(config)
+        if not architectures:
             raise ModelDownloadRequestError(
                 f"{resolved_id} has no GGUF files, and its config.json doesn't say what model it is, "
                 "so it can't be converted."
@@ -567,10 +598,18 @@ class ModelDownloadService:
         build = parse_build_name(runtime.id)
         tag = build.tag if build else runtime.id
         supported = self.converter.architectures(tag)
-        if supported is not None and architecture not in supported:
-            raise ModelDownloadRequestError(self._unconvertible(resolved_id, architecture, tag))
+        architecture = _convertible_as(architectures, supported)
+        if architecture is None:
+            raise ModelDownloadRequestError(self._unconvertible(resolved_id, architectures, tag))
 
+        encoder = vision_architecture(config) if has_vision_weights is not False else None
+        vision_parameters = self._vision_parameters(resolved_id, revision) if encoder else None
+        if vision_parameters == 0:
+            encoder = None  # Its config declares one, but none of its weights are one.
+        # The Hub's count includes the vision encoder, which the text model leaves out.
         parameters = _parameter_count(info) or (weights.size_bytes or 0) // 2
+        if vision_parameters and vision_parameters < parameters:
+            parameters -= vision_parameters
         options = conversion_options(resolved_id, parameters)
         annotate_fit(
             HfModelRequirements(
@@ -580,6 +619,7 @@ class ModelDownloadService:
             self._budget(),
         )
         target = self._pick_model(options, quantization)
+        vision, vision_note = self._plan_vision(resolved_id, tag, encoder, vision_parameters, vision_encoder)
 
         notes: list[str] = []
         if supported is None:
@@ -587,10 +627,8 @@ class ModelDownloadService:
                 f"llama.cpp's converter for {tag} isn't set up yet, so it's set up first. "
                 "That's needed once, and takes about 1 GB."
             )
-        if any(role.has_vision_weights for role in requirements.roles) or any(
-            role.role.startswith(VISION_ENCODER) and role.present for role in requirements.roles
-        ):
-            notes.append("Converted as a text model: converting its vision encoder isn't supported yet.")
+        if vision_note:
+            notes.append(vision_note)
         if quantization.casefold() != AUTO and target.fit == "too_large":
             notes.append(
                 f"{target.id} is estimated not to fit in this machine's free memory, "
@@ -600,43 +638,124 @@ class ModelDownloadService:
             repo_id=resolved_id,
             revision=revision,
             architecture=architecture,
+            architectures=tuple(architectures),
             parameters=parameters,
             files=files,
             target=target,
             runtime=runtime,
             tag=tag,
             notes=tuple(notes),
+            vision=vision,
+            vision_architecture=encoder,
+            vision_parameters=vision_parameters or None,
+            vision_chosen=vision_encoder.casefold() not in (AUTO, NONE),
         )
 
     @staticmethod
-    def _safetensors_weights(repo_id: str, info: Any, requirements: HfModelRequirements) -> HfRoleOption:
-        options = [
-            option
+    def _safetensors_weights(
+        repo_id: str, info: Any, requirements: HfModelRequirements
+    ) -> tuple[HfRoleOption, bool | None]:
+        """The weights to convert, and whether they include a vision encoder,
+        which is None when that's unknown."""
+        found = [
+            (option, role.has_vision_weights)
             for role in requirements.roles
             if role.role.startswith(LANGUAGE_MODEL)
             for option in role.options
             if option.format == "safetensors"
         ]
-        if not options and not any(role.present for role in requirements.roles):
+        if not found and not any(role.present for role in requirements.roles):
             unrecognised = _converter_weights(info)
             if unrecognised is not None:
-                return unrecognised
-        if not options:
+                return unrecognised, None
+        if not found:
             formats = sorted({option.format for role in requirements.roles for option in role.options if option.format})
-            found = f" It has {', '.join(formats)} weights, which aren't safe or can't be converted." if formats else ""
+            known = f" It has {', '.join(formats)} weights, which aren't safe or can't be converted." if formats else ""
             raise ModelDownloadRequestError(
-                f"{repo_id} has neither GGUF files to run nor safetensors weights to convert.{found}"
+                f"{repo_id} has neither GGUF files to run nor safetensors weights to convert.{known}"
             )
         # The plain weights, rather than a variant such as an int8 copy.
-        plain = [option for option in options if option.variant is None and option.quantization is None]
-        return min(plain or options, key=lambda option: option.size_bytes or 0)
+        plain = [pair for pair in found if pair[0].variant is None and pair[0].quantization is None]
+        return min(plain or found, key=lambda pair: pair[0].size_bytes or 0)
+
+    def _config(self, repo_id: str, revision: str | None, info: Any) -> dict[str, Any]:
+        """The repo's config.json, which is what the converter goes by. The Hub's
+        summary of it leaves out a vision model's text and vision configs, so
+        it's only used when there's no config.json to read."""
+        response = self.client.get(hf_hub_url(repo_id, CONFIG_FILE, revision=revision), follow_redirects=True)
+        if response.status_code in (401, 403):
+            raise self._gated(repo_id)
+        if response.status_code != 404 and not response.is_success:
+            raise HubUnavailableError(f"Hugging Face answered {response.status_code} for {repo_id}'s {CONFIG_FILE}")
+        try:
+            config = response.json() if response.is_success else None
+        except ValueError:
+            config = None
+        if isinstance(config, dict):
+            return config
+        summary = getattr(info, "config", None)
+        return summary if isinstance(summary, dict) else {}
+
+    def _vision_parameters(self, repo_id: str, revision: str | None) -> int | None:
+        """How many of the weights are the vision encoder's, from the safetensors
+        headers: 0 if none are, and None if the headers couldn't be read."""
+        try:
+            metadata = self.hf.api.get_safetensors_metadata(repo_id, revision=revision)
+        except (
+            HfHubHTTPError,
+            NotASafetensorsRepoError,
+            SafetensorsParsingError,
+            OSError,
+            ValueError,
+            httpx.HTTPError,
+        ) as error:
+            logger.warning("Couldn't read the safetensors headers of %s: %s", repo_id, error)
+            return None
+        return sum(
+            tensor.parameter_count
+            for file in metadata.files_metadata.values()
+            for name, tensor in file.tensors.items()
+            if is_vision_key(name)
+        )
+
+    def _plan_vision(
+        self, repo_id: str, tag: str, architecture: str | None, parameters: int | None, wanted: str
+    ) -> tuple[HfRoleOption | None, str | None]:
+        """The vision encoder to convert, if any, and a note when `auto` leaves
+        one out. Until the converter is set up, whether it can is only known
+        once it is."""
+        folded = wanted.casefold()
+        if folded == NONE:
+            return None, None
+        if architecture is None:
+            if folded == AUTO:
+                return None, None
+            raise ModelDownloadRequestError(f"{repo_id} has no vision encoder to convert.")
+        supported = self.converter.vision_architectures(tag)
+        if supported is not None and architecture not in supported:
+            reason = self._vision_unconvertible(architecture, tag)
+            if folded == AUTO:
+                return None, f"Converted as a text model: {reason}"
+            raise ModelDownloadRequestError(f"{reason} Choose vision_encoder none to convert it as a text model.")
+        options = vision_conversion_options(repo_id, parameters)
+        if folded == AUTO:
+            return next(option for option in options if option.id == VISION_DEFAULT), None
+        try:
+            return match_option(options, wanted), None
+        except OptionChoiceError as error:
+            raise ModelDownloadRequestError(f"Vision encoder {error}") from error
 
     @staticmethod
-    def _unconvertible(repo_id: str, architecture: str, tag: str) -> str:
+    def _unconvertible(repo_id: str, architectures: list[str] | tuple[str, ...], tag: str) -> str:
+        # The last is the model's own name, which is the one people know it by.
         return (
-            f"llama.cpp {tag} can't convert {architecture} models, so {repo_id} can't be converted. "
+            f"llama.cpp {tag} can't convert {architectures[-1]} models, so {repo_id} can't be converted. "
             "Look for a GGUF version of it on Hugging Face, or try a newer llama.cpp runtime."
         )
+
+    @staticmethod
+    def _vision_unconvertible(architecture: str, tag: str) -> str:
+        return f"llama.cpp {tag} can't convert {architecture}'s vision encoder."
 
     def _start_conversion(self, plan: _ConversionPlan) -> JobInfo:
         self._check_conversion_space(plan)
@@ -648,30 +767,62 @@ class ModelDownloadService:
 
         return self.jobs.submit(
             "model_conversion",
-            f"{plan.repo_id}:{plan.target.id}+{NONE}",
+            f"{plan.repo_id}:{plan.target.id}+{plan.vision.id if plan.vision else NONE}",
             work,
-            details={
-                "repo_id": plan.repo_id,
-                "task": TEXT_GENERATION_TASK,
-                "revision": plan.revision,
-                "quantization": plan.target.id,
-                "vision_encoder": None,
-                "size_bytes": plan.source_bytes,
-                "conversion": {
-                    "source_format": "safetensors",
-                    "architecture": plan.architecture,
-                    "parameters": plan.parameters,
-                    "converter": plan.tag,
-                    "estimated_size_bytes": plan.target.size_bytes,
-                    "disk_needed_bytes": plan.disk_bytes,
-                },
-            },
+            details=self._conversion_details(plan),
         )
+
+    def _conversion_details(self, plan: _ConversionPlan) -> dict[str, Any]:
+        return {
+            "repo_id": plan.repo_id,
+            "task": TEXT_GENERATION_TASK,
+            "revision": plan.revision,
+            "quantization": plan.target.id,
+            "vision_encoder": plan.vision.id if plan.vision else None,
+            "size_bytes": plan.source_bytes,
+            "conversion": {
+                "source_format": "safetensors",
+                "architecture": plan.architecture,
+                "parameters": plan.parameters,
+                "converter": plan.tag,
+                "estimated_size_bytes": plan.target.size_bytes,
+                "disk_needed_bytes": self._disk_needed(plan),
+                "vision_encoder": (
+                    {
+                        "architecture": plan.vision_architecture,
+                        "parameters": plan.vision_parameters,
+                        "estimated_size_bytes": plan.vision.size_bytes,
+                    }
+                    if plan.vision
+                    else None
+                ),
+            },
+        }
+
+    def _converted_already(self, plan: _ConversionPlan) -> tuple[bool, bool]:
+        """Whether the text model is converted already, and the vision encoder
+        if one's wanted."""
+        folder = self._folder(plan.repo_id)
+        manifest = _read_manifest(folder) or {"files": {}}
+
+        def done(option: HfRoleOption) -> bool:
+            return _is_complete(folder, option.files[0], manifest["files"].get(option.files[0]))
+
+        return done(plan.target), plan.vision is None or done(plan.vision)
+
+    def _disk_needed(self, plan: _ConversionPlan) -> int:
+        """The most what's left to convert takes at once. A vision encoder is
+        converted from the same download, and kept, so it adds to all of it."""
+        text_done, vision_done = self._converted_already(plan)
+        vision = 0 if vision_done else plan.vision_bytes
+        if not text_done:
+            return plan.text_disk_bytes + vision
+        return 0 if vision_done else plan.source_bytes + vision
 
     def _check_conversion_space(self, plan: _ConversionPlan) -> None:
         """What's downloaded or converted already counts towards the peak."""
         folder = self._folder(plan.repo_id)
-        needed = max(plan.disk_bytes - _tree_size(folder / SOURCE_DIR), 0)
+        needed = max(self._disk_needed(plan) - _tree_size(folder / SOURCE_DIR), 0)
         free = _free_bytes(self.root)
         if free is not None and free < needed + SPACE_MARGIN_BYTES:
             raise NotEnoughSpaceError(
@@ -759,21 +910,19 @@ class ModelDownloadService:
 
     @staticmethod
     def _record_option(manifest: dict[str, Any], choice: _Choice) -> None:
-        record = {
-            "role": choice.role,
-            "id": choice.option.id,
-            "label": choice.option.label,
-            "quantization": choice.option.quantization,
-            "variant": choice.option.variant,
-            "files": [file.path for file in choice.files],
-            "shards": len(choice.files),
-            "size_bytes": choice.size_bytes,
-        }
-        for index, existing in enumerate(manifest["options"]):
-            if existing.get("role") == choice.role and existing.get("id") == choice.option.id:
-                manifest["options"][index] = record
-                return
-        manifest["options"].append(record)
+        _upsert_option(
+            manifest,
+            {
+                "role": choice.role,
+                "id": choice.option.id,
+                "label": choice.option.label,
+                "quantization": choice.option.quantization,
+                "variant": choice.option.variant,
+                "files": [file.path for file in choice.files],
+                "shards": len(choice.files),
+                "size_bytes": choice.size_bytes,
+            },
+        )
 
     def _fetch(
         self,
@@ -840,47 +989,98 @@ class ModelDownloadService:
     def _convert(self, context: JobContext, plan: _ConversionPlan) -> dict[str, Any]:
         folder = self._folder(plan.repo_id)
         source = folder / SOURCE_DIR
-        final = folder / plan.target.files[0]
-        manifest = _read_manifest(folder)
-        if manifest is not None and _is_complete(folder, final.name, manifest["files"].get(final.name)):
-            return self._conversion_result(plan, final, already_converted=True)
+        text_done, vision_done = self._converted_already(plan)
+        if text_done and vision_done:
+            return self._conversion_result(plan, already_converted=True)
 
         if self.converter.architectures(plan.tag) is None:
             self.converter.ensure_installed(context, plan.tag)
-            if plan.architecture not in (self.converter.architectures(plan.tag) or []):
-                raise ModelDownloadError(self._unconvertible(plan.repo_id, plan.architecture, plan.tag))
+            plan = self._check_new_converter(context, plan, text_done)
+            vision_done = vision_done or plan.vision is None
+            if text_done and vision_done:
+                return self._conversion_result(plan, already_converted=True)
         # It may have sat in the queue while another download used the space up.
         self._check_conversion_space(plan)
-        self._record_conversion(plan)
+        if not text_done:
+            self._record_conversion(plan)
 
+        final = folder / plan.target.files[0]
         intermediate = source / gguf_name(plan.repo_id, INTERMEDIATE)
-        if plan.direct or not intermediate.is_file() or _source_revision(source) != plan.revision:
+        convert_text = not text_done and (
+            plan.direct or not intermediate.is_file() or _source_revision(source) != plan.revision
+        )
+        if convert_text or not vision_done:
             self._download_source(context, plan, source)
-            context.update(stage="converting", current_file=None)
-            converted = final if plan.direct else intermediate
-            partial = _partial_path(converted)
-            convert(
-                context,
-                self.converter.command(plan.tag),
-                source,
-                partial,
-                plan.target.id if plan.direct else INTERMEDIATE,
-            )
-            os.replace(partial, converted)
+            command = self.converter.command(plan.tag)
+            if convert_text:
+                context.update(stage="converting", current_file=None)
+                converted = final if plan.direct else intermediate
+                partial = _partial_path(converted)
+                convert(context, command, source, partial, plan.target.id if plan.direct else INTERMEDIATE)
+                os.replace(partial, converted)
+            if plan.vision is not None and not vision_done:
+                plan = self._convert_vision(context, plan, plan.vision, command, source)
             # The BF16 is all that quantizing needs. Kept if quantizing fails, so
             # trying again starts from it.
             for file in plan.files:
                 (source / file.path).unlink(missing_ok=True)
-        if not plan.direct:
-            context.update(stage="quantizing", current_file=None)
-            partial = _partial_path(final)
-            quantize(context, plan.runtime, intermediate, partial, plan.target.id)
-            os.replace(partial, final)
-
-        context.update(stage="finalizing", current_file=None)
-        self._finish_conversion(plan, final)
+        if not text_done:
+            if not plan.direct:
+                context.update(stage="quantizing", current_file=None)
+                partial = _partial_path(final)
+                quantize(context, plan.runtime, intermediate, partial, plan.target.id)
+                os.replace(partial, final)
+            context.update(stage="finalizing", current_file=None)
+            self._save_converted(plan, LANGUAGE_MODEL, plan.target, final)
         shutil.rmtree(source, ignore_errors=True)
-        return self._conversion_result(plan, final, already_converted=False)
+        return self._conversion_result(plan, already_converted=False)
+
+    def _check_new_converter(self, context: JobContext, plan: _ConversionPlan, text_done: bool) -> _ConversionPlan:
+        """What a converter can convert is only known once it's set up. A vision
+        encoder left to `auto` that it can't convert is done without."""
+        architecture = _convertible_as(plan.architectures, self.converter.architectures(plan.tag) or [])
+        if architecture is None and not text_done:
+            raise ModelDownloadError(self._unconvertible(plan.repo_id, plan.architectures, plan.tag))
+        if architecture is not None:
+            plan = replace(plan, architecture=architecture)
+        supported = self.converter.vision_architectures(plan.tag) or []
+        if plan.vision is not None and plan.vision_architecture not in supported:
+            reason = self._vision_unconvertible(plan.vision_architecture or "its", plan.tag)
+            if plan.vision_chosen:
+                raise ModelDownloadError(reason)
+            context.note(f"Converted as a text model: {reason}")
+            plan = replace(plan, vision=None)
+        context.update(details=self._conversion_details(plan))
+        return plan
+
+    def _convert_vision(
+        self,
+        context: JobContext,
+        plan: _ConversionPlan,
+        vision: HfRoleOption,
+        command: ConverterCommand,
+        source: Path,
+    ) -> _ConversionPlan:
+        """Converts the vision encoder from the same download as the text model.
+        One left to `auto` that fails is done without, as one the converter
+        doesn't know is, rather than failing the text model with it."""
+        final = self._folder(plan.repo_id) / vision.files[0]
+        # In the download's folder until it's done, so what a failure leaves goes with that.
+        partial = _partial_path(source / final.name)
+        context.update(stage="converting_vision_encoder", current_file=None)
+        try:
+            convert(context, command, source, partial, vision.id, vision=True)
+        except ConversionError as error:
+            partial.unlink(missing_ok=True)
+            if plan.vision_chosen:
+                raise
+            context.note(f"Converted as a text model: its vision encoder couldn't be converted. {error}")
+            plan = replace(plan, vision=None)
+            context.update(details=self._conversion_details(plan))
+            return plan
+        os.replace(partial, final)
+        self._save_converted(plan, VISION_ENCODER, vision, final)
+        return plan
 
     def _download_source(self, context: JobContext, plan: _ConversionPlan, source: Path) -> None:
         """Into `source`, resuming what an earlier try left, unless that was of
@@ -909,7 +1109,9 @@ class ModelDownloadService:
 
     def _record_conversion(self, plan: _ConversionPlan) -> None:
         """Written before anything is downloaded, so an unfinished conversion
-        shows up in the library and can be deleted from there."""
+        shows up in the library and can be deleted from there. A vision encoder
+        is only recorded once it's converted: what an unfinished one leaves is
+        in the download's folder, which goes with the text model's record."""
         folder = self._folder(plan.repo_id)
         name = plan.target.files[0]
         with self._lock:
@@ -919,33 +1121,14 @@ class ModelDownloadService:
                 "options": [],
                 "files": {},
             }
-            record = {
-                "role": LANGUAGE_MODEL,
-                "id": plan.target.id,
-                "label": plan.target.label,
-                "quantization": plan.target.quantization,
-                "variant": None,
-                "files": [name],
-                "shards": 1,
-                "size_bytes": plan.target.size_bytes,
-                "converted": {"from_revision": plan.revision, "converter": plan.tag},
-            }
-            options = manifest["options"]
-            matching = [
-                index
-                for index, existing in enumerate(options)
-                if existing.get("role") == LANGUAGE_MODEL and existing.get("id") == plan.target.id
-            ]
-            if matching:
-                options[matching[0]] = record
-            else:
-                options.append(record)
+            _upsert_option(manifest, self._converted_record(plan, LANGUAGE_MODEL, plan.target, plan.target.size_bytes))
             entry = manifest["files"].get(name)
             if not (entry and entry.get("verified")):
                 manifest["files"][name] = {"size": None, "sha256": None, "revision": plan.revision, "verified": False}
             _write_manifest(folder, manifest)
 
-    def _finish_conversion(self, plan: _ConversionPlan, final: Path) -> None:
+    def _save_converted(self, plan: _ConversionPlan, role: str, option: HfRoleOption, final: Path) -> None:
+        """Records a converted file as finished, at its real size."""
         folder = self._folder(plan.repo_id)
         size = _size_of(final)
         with self._lock:
@@ -953,20 +1136,34 @@ class ModelDownloadService:
             if manifest is None:
                 raise ModelDownloadError(f"{plan.repo_id}'s record of its files went missing while it was converted")
             manifest["files"][final.name] = {"size": size, "sha256": None, "revision": plan.revision, "verified": True}
-            for record in manifest["options"]:
-                if record.get("role") == LANGUAGE_MODEL and record.get("id") == plan.target.id:
-                    record["size_bytes"] = size
+            _upsert_option(manifest, self._converted_record(plan, role, option, size))
             _write_manifest(folder, manifest)
 
-    def _conversion_result(self, plan: _ConversionPlan, final: Path, already_converted: bool) -> dict[str, Any]:
+    @staticmethod
+    def _converted_record(plan: _ConversionPlan, role: str, option: HfRoleOption, size: int | None) -> dict[str, Any]:
+        return {
+            "role": role,
+            "id": option.id,
+            "label": option.label,
+            "quantization": option.quantization,
+            "variant": None,
+            "files": [option.files[0]],
+            "shards": 1,
+            "size_bytes": size,
+            "converted": {"from_revision": plan.revision, "converter": plan.tag},
+        }
+
+    def _conversion_result(self, plan: _ConversionPlan, already_converted: bool) -> dict[str, Any]:
+        folder = self._folder(plan.repo_id)
+        final = folder / plan.target.files[0]
         return {
             "repo_id": plan.repo_id,
             "task": TEXT_GENERATION_TASK,
-            "directory": str(final.parent),
+            "directory": str(folder),
             "quantization": plan.target.id,
             "model_path": str(final),
-            "vision_encoder": None,
-            "vision_encoder_path": None,
+            "vision_encoder": plan.vision.id if plan.vision else None,
+            "vision_encoder_path": str(folder / plan.vision.files[0]) if plan.vision else None,
             "already_downloaded": already_converted,
             "converted_with": plan.tag,
             "size_bytes": _size_of(final),
@@ -1184,10 +1381,13 @@ class ModelDownloadService:
 
     @staticmethod
     def _delete_options(folder: Path, manifest: dict[str, Any], doomed: list[dict[str, Any]]) -> None:
-        if any(record.get("converted") for record in doomed):
-            # What an unfinished conversion left. Nothing's converting: that blocks deleting.
-            shutil.rmtree(folder / SOURCE_DIR, ignore_errors=True)
         manifest["options"] = [record for record in manifest["options"] if record not in doomed]
+        if any(record.get("converted") and record.get("role") == LANGUAGE_MODEL for record in doomed) or not any(
+            record.get("converted") for record in manifest["options"]
+        ):
+            # What an unfinished conversion left, which is the text model's. Nothing's
+            # converting: that blocks deleting.
+            shutil.rmtree(folder / SOURCE_DIR, ignore_errors=True)
         if not manifest["options"]:
             shutil.rmtree(folder)
             return

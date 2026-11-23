@@ -38,7 +38,10 @@ async def start_download(request: ModelDownloadRequest) -> JobInfo:
     takes more disk, RAM and time than a download; the job's
     `details.conversion` says how much disk. `quantization` is then one of
     BF16, F16, Q8_0, Q6_K, Q5_K_M, Q5_K_S, Q4_K_M, Q4_K_S, Q4_0, Q3_K_L,
-    Q3_K_M, Q3_K_S or Q2_K, and its vision encoder isn't converted yet."""
+    Q3_K_M, Q3_K_S or Q2_K. A vision model's vision encoder is converted from
+    the same download, as F16 unless `vision_encoder` is BF16, Q8_0 or `none`.
+    Left to `auto`, one the converter can't convert is left out with a note,
+    and the model is converted as a text model."""
     try:
         return await to_thread.run_sync(service.start, request.repo_id, request.quantization, request.vision_encoder)
     except HfHubHTTPError as error:
