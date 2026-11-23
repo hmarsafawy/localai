@@ -1,6 +1,7 @@
-"""Downloads of repos with no GGUF, which are converted from their safetensors.
-The converter and `llama-quantize` are stood in for: they're run for real by
-hand (and their output below is theirs, from converting SmolLM2-135M)."""
+"""Downloads of repos with no GGUF, which are converted from their safetensors,
+along with a vision model's vision encoder. The converter and `llama-quantize`
+are stood in for: they're run for real by hand (and their output below is
+theirs, from converting SmolLM2-135M)."""
 
 from __future__ import annotations
 
@@ -32,9 +33,14 @@ from services.model_conversion import (
     gguf_name,
     parse_quantized_tensor,
     parse_writing,
+    text_architectures,
+    vision_architecture,
+    vision_conversion_options,
+    vision_gguf_name,
 )
 from services.model_downloads import (
     SOURCE_DIR,
+    LocalModelChoiceError,
     ModelDownloadRequestError,
     ModelDownloadService,
     NotEnoughSpaceError,
@@ -62,6 +68,15 @@ FILES = {
 WANTED = {name for name in FILES if "/" not in name and not name.endswith((".md", ".py", ".bin"))}
 # config.json is read first as well, to tell what to convert the model as.
 FETCHED = sorted([*WANTED, "config.json"])
+# SmolVLM-256M-Instruct's, cut down: the converter takes its text model by the
+# text config's name and its vision encoder by the model's.
+VISION_CONFIG = {
+    "architectures": ["Idefics3ForConditionalGeneration"],
+    "text_config": {"architectures": ["VLlama3ForCausalLM"], "model_type": "llama"},
+    "vision_config": {"model_type": "idefics3"},
+}
+VISION_PARAMETERS = 93_000_000
+MMPROJ = "mmproj-SmolLM2-135M-Instruct-F16.gguf"
 
 
 class FakeHub:
@@ -89,6 +104,8 @@ class FakeHf:
         self._architectures: list[str] | None = ["LlamaForCausalLM"]
         self.parameters: int | None = 134_515_008
         self.vision = False
+        self.vision_parameters = 0
+        self.headers_error: Exception | None = None
         # Whether the weights' tensor names are ones the requirements know.
         self.recognised = True
 
@@ -102,10 +119,18 @@ class FakeHf:
         self._architectures = value
         self.hub.files["config.json"] = json.dumps({"architectures": value} if value else {}).encode()
 
+    def make_vision(self) -> None:
+        """Makes the model a vision model, with its vision encoder in its weights."""
+        self._architectures = VISION_CONFIG["architectures"]
+        self.hub.files["config.json"] = json.dumps(VISION_CONFIG).encode()
+        self.vision = True
+        self.vision_parameters = VISION_PARAMETERS
+
     def model_info(self, repo_id: str, files_metadata: bool = False) -> SimpleNamespace:
         return SimpleNamespace(
             id=REPO,
             sha=self.revision,
+            # The Hub's summary leaves out a vision model's text and vision configs.
             config={"architectures": self._architectures} if self._architectures else {},
             safetensors=SimpleNamespace(total=self.parameters) if self.parameters else None,
             siblings=[
@@ -135,6 +160,16 @@ class FakeHf:
         role = HfRequirementRole(role="language_model", present=True, options=options, has_vision_weights=self.vision)
         return HfModelRequirements(model_id=REPO, roles=[role])
 
+    def get_safetensors_metadata(self, repo_id: str, revision: str | None = None) -> SimpleNamespace:
+        if self.headers_error is not None:
+            raise self.headers_error
+        tensors = {"model.text_model.layers.0.mlp.weight": SimpleNamespace(parameter_count=self.parameters or 0)}
+        if self.vision_parameters:
+            tensors["model.vision_model.encoder.layers.0.mlp.weight"] = SimpleNamespace(
+                parameter_count=self.vision_parameters
+            )
+        return SimpleNamespace(files_metadata={"model.safetensors": SimpleNamespace(tensors=tensors)})
+
 
 class FakeRuntimes:
     def __init__(self) -> None:
@@ -149,19 +184,22 @@ class FakeRuntimes:
 class FakeConverter:
     def __init__(self) -> None:
         self.runtimes = FakeRuntimes()
-        self.supported: list[str] | None = ["LlamaForCausalLM", "Qwen3ForCausalLM"]
-        self.after_install: list[str] = ["LlamaForCausalLM"]
+        self.supported: list[str] | None = ["LlamaForCausalLM", "Qwen3ForCausalLM", "VLlama3ForCausalLM"]
+        self.after_install: list[str] = ["LlamaForCausalLM", "VLlama3ForCausalLM"]
+        self.vision_supported: list[str] | None = ["Idefics3ForConditionalGeneration"]
+        self.vision_after_install: list[str] = ["Idefics3ForConditionalGeneration"]
         self.installs: list[str] = []
 
     def architectures(self, tag: str) -> list[str] | None:
         return self.supported
 
     def vision_architectures(self, tag: str) -> list[str] | None:
-        return None if self.supported is None else []
+        return None if self.supported is None else self.vision_supported
 
     def ensure_installed(self, context: JobContext, tag: str) -> dict:
         self.installs.append(tag)
         self.supported = self.after_install
+        self.vision_supported = self.vision_after_install
         return {}
 
     def command(self, tag: str) -> ConverterCommand:
@@ -173,13 +211,30 @@ class Tools:
 
     def __init__(self) -> None:
         self.converted: list[tuple[Path, Path, str]] = []
+        self.converted_vision: list[tuple[Path, Path, str]] = []
         self.quantized: list[tuple[Path, Path, str]] = []
         self.quantize_error: Exception | None = None
+        self.vision_error: Exception | None = None
 
-    def convert(self, context: JobContext, converter: ConverterCommand, source: Path, outfile: Path, quantization: str) -> None:
+    def convert(
+        self,
+        context: JobContext,
+        converter: ConverterCommand,
+        source: Path,
+        outfile: Path,
+        quantization: str,
+        vision: bool = False,
+    ) -> None:
         assert (source / "model.safetensors").is_file() and (source / "config.json").is_file()
-        self.converted.append((source, outfile, quantization))
         context.begin_transfer(None)
+        if vision:
+            self.converted_vision.append((source, outfile, quantization))
+            outfile.write_bytes(b"half written")
+            if self.vision_error is not None:
+                raise self.vision_error
+            outfile.write_bytes(f"MMPROJ {quantization}".encode() * 30)
+            return
+        self.converted.append((source, outfile, quantization))
         outfile.write_bytes(f"GGUF {quantization}".encode() * 100)
 
     def quantize(self, context: JobContext, runtime: LaunchableRuntime, source: Path, outfile: Path, quantization: str) -> None:
@@ -444,6 +499,293 @@ def test_weights_in_a_subfolder_are_refused(service: ModelDownloadService, hub: 
         service.start(REPO)
 
 
+# Vision encoders
+
+
+def test_a_vision_models_encoder_is_converted_from_the_same_download(
+    service: ModelDownloadService, hub: FakeHub, hf: FakeHf, tools: Tools
+) -> None:
+    hf.make_vision()
+    job = service.start(REPO, quantization="Q4_K_M")
+    assert job.details["vision_encoder"] == "F16"
+    conversion = job.details["conversion"]
+    # The text model goes by its text config, and leaves the vision encoder out.
+    assert conversion["architecture"] == "VLlama3ForCausalLM"
+    assert conversion["parameters"] == 134_515_008 - VISION_PARAMETERS
+    assert conversion["vision_encoder"] == {
+        "architecture": "Idefics3ForConditionalGeneration",
+        "parameters": VISION_PARAMETERS,
+        "estimated_size_bytes": VISION_PARAMETERS * 2 + 1_000_000,
+    }
+
+    done = wait_for(service, job)
+    assert done.status == "completed", done.error
+    folder = folder_of(service)
+    source = folder / SOURCE_DIR
+    assert sorted(hub.gets) == FETCHED  # Downloaded once for both.
+    [(converted_from, outfile, outtype)] = tools.converted_vision
+    assert (converted_from, outfile, outtype) == (source, source / f"{MMPROJ}.partial", "F16")
+    assert done.result is not None
+    assert done.result["vision_encoder"] == "F16"
+    assert done.result["vision_encoder_path"] == str(folder / MMPROJ)
+    assert sorted(path.name for path in folder.iterdir()) == [
+        "SmolLM2-135M-Instruct-Q4_K_M.gguf",
+        "localai-model.json",
+        MMPROJ,
+    ]
+
+    [model] = service.library().models
+    [vision] = model.vision_encoders
+    assert (vision.id, vision.status, vision.converted) == ("F16", "complete", True)
+    assert vision.size_bytes == (folder / MMPROJ).stat().st_size
+    assert model.size_on_disk_bytes == sum(path.stat().st_size for path in folder.glob("*.gguf"))
+    # And it's run with the model, as a downloaded one is.
+    selection = service.local_selection(REPO)
+    assert selection.vision is not None and selection.vision.path == str(folder / MMPROJ)
+
+
+def source_bytes(hub: FakeHub) -> int:
+    return sum(len(body) for name, body in hub.files.items() if name in WANTED)
+
+
+def test_space_for_the_vision_encoder_is_counted(
+    service: ModelDownloadService, hub: FakeHub, hf: FakeHf, space: dict
+) -> None:
+    hf.make_vision()
+    hf.parameters = 8_030_000_000
+    hf.vision_parameters = 600_000_000
+    text = source_bytes(hub) + estimated_size_bytes(8_030_000_000 - 600_000_000, "BF16")
+    vision = 600_000_000 * 2 + 1_000_000
+    space["bytes"] = text + vision + 10**9 - 1
+    with pytest.raises(NotEnoughSpaceError, match="converting HuggingFaceTB/SmolLM2-135M-Instruct to BF16"):
+        service.start(REPO, quantization="BF16")
+    space["bytes"] += 1
+    job = service.start(REPO, quantization="BF16")
+    assert job.details["conversion"]["disk_needed_bytes"] == text + vision
+    wait_for(service, job)
+
+
+def test_a_vision_encoder_can_be_left_out_and_added_later(
+    service: ModelDownloadService, hub: FakeHub, hf: FakeHf, tools: Tools
+) -> None:
+    hf.make_vision()
+    done = wait_for(service, service.start(REPO, quantization="Q4_K_M", vision_encoder="none"))
+    assert done.status == "completed", done.error
+    assert done.details["vision_encoder"] is None and done.details["conversion"]["vision_encoder"] is None
+    assert tools.converted_vision == [] and done.notes == []
+    assert service.library().models[0].vision_encoders == []
+
+    # Asked for later, it's converted on its own from a new download.
+    hub.gets.clear()
+    job = service.start(REPO, quantization="Q4_K_M", vision_encoder="Q8_0")
+    # Only the download and the vision encoder.
+    [q8_0] = [option for option in vision_conversion_options(REPO, VISION_PARAMETERS) if option.id == "Q8_0"]
+    assert job.details["conversion"]["disk_needed_bytes"] == source_bytes(hub) + q8_0.size_bytes
+    done = wait_for(service, job)
+    assert done.status == "completed", done.error
+    assert sorted(hub.gets) == FETCHED
+    assert len(tools.converted) == 1 and len(tools.quantized) == 1
+    assert [outtype for _, _, outtype in tools.converted_vision] == ["Q8_0"]
+    assert not (folder_of(service) / SOURCE_DIR).exists()
+    [vision] = service.library().models[0].vision_encoders
+    assert vision.id == "Q8_0"
+
+    # And then it's all there already.
+    again = wait_for(service, service.start(REPO, quantization="Q4_K_M", vision_encoder="Q8_0"))
+    assert again.result is not None and again.result["already_downloaded"] is True
+
+
+def test_a_vision_encoder_is_chosen_from_what_the_converter_writes(service: ModelDownloadService, hf: FakeHf) -> None:
+    hf.make_vision()
+    with pytest.raises(ModelDownloadRequestError, match="Vision encoder 'Q4_K_M' isn't available. Available: F16, BF16, Q8_0"):
+        service.start(REPO, vision_encoder="Q4_K_M")
+    job = service.start(REPO, quantization="Q8_0", vision_encoder="bf16")
+    assert job.details["vision_encoder"] == "BF16"
+    wait_for(service, job)
+
+
+def test_asking_for_a_vision_encoder_a_model_lacks_is_an_error(service: ModelDownloadService, hf: FakeHf) -> None:
+    with pytest.raises(ModelDownloadRequestError, match="has no vision encoder to convert"):
+        service.start(REPO, vision_encoder="F16")
+    # One its config declares, but whose weights aren't there, isn't one either.
+    hf.make_vision()
+    hf.vision = False
+    with pytest.raises(ModelDownloadRequestError, match="has no vision encoder to convert"):
+        service.start(REPO, vision_encoder="F16")
+    job = service.start(REPO, quantization="Q4_K_M")
+    assert job.details["vision_encoder"] is None
+    wait_for(service, job)
+
+
+def test_weights_whose_headers_have_no_vision_encoder_dont_get_one(
+    service: ModelDownloadService, hf: FakeHf, tools: Tools
+) -> None:
+    # Unrecognised tensor names: whether there's a vision encoder is up to the headers.
+    hf.make_vision()
+    hf.recognised = False
+    hf.vision_parameters = 0
+    done = wait_for(service, service.start(REPO, quantization="Q4_K_M"))
+    assert done.status == "completed", done.error
+    assert done.details["vision_encoder"] is None and tools.converted_vision == []
+
+
+def test_unreadable_headers_still_get_the_vision_encoder_converted(
+    service: ModelDownloadService, hf: FakeHf, tools: Tools
+) -> None:
+    hf.make_vision()
+    hf.headers_error = OSError("connection reset")
+    job = service.start(REPO, quantization="Q4_K_M")
+    # Without them, there's no telling the vision encoder's size.
+    assert job.details["conversion"]["parameters"] == 134_515_008
+    assert job.details["conversion"]["vision_encoder"]["estimated_size_bytes"] is None
+    done = wait_for(service, job)
+    assert done.status == "completed", done.error
+    assert len(tools.converted_vision) == 1
+
+
+def test_a_vision_encoder_the_converter_cant_convert_is_left_out_unless_asked_for(
+    service: ModelDownloadService, hf: FakeHf, converter: FakeConverter, tools: Tools
+) -> None:
+    hf.make_vision()
+    converter.vision_supported = ["Qwen2VLForConditionalGeneration"]
+    reason = "llama.cpp b12359 can't convert Idefics3ForConditionalGeneration's vision encoder."
+    with pytest.raises(ModelDownloadRequestError, match=f"{reason} Choose vision_encoder none"):
+        service.start(REPO, vision_encoder="F16")
+    done = wait_for(service, service.start(REPO, quantization="Q4_K_M"))
+    assert done.status == "completed", done.error
+    assert done.notes == [f"Converted as a text model: {reason}"]
+    assert done.details["vision_encoder"] is None and tools.converted_vision == []
+
+
+def test_a_new_converters_vision_encoders_are_checked_once_its_set_up(
+    service: ModelDownloadService, hf: FakeHf, converter: FakeConverter, hub: FakeHub, tools: Tools
+) -> None:
+    hf.make_vision()
+    converter.supported = None
+    converter.vision_after_install = []
+    job = service.start(REPO, quantization="Q4_K_M")
+    assert job.details["vision_encoder"] == "F16"
+    done = wait_for(service, job)
+    assert done.status == "completed", done.error
+    assert any("can't convert Idefics3ForConditionalGeneration's vision encoder" in note for note in done.notes)
+    assert done.details["vision_encoder"] is None and done.details["conversion"]["vision_encoder"] is None
+    assert tools.converted_vision == []
+
+    # Asked for by name, it fails before downloading anything.
+    service.delete(REPO)
+    converter.supported = None
+    hub.gets.clear()
+    failed = wait_for(service, service.start(REPO, quantization="Q4_K_M", vision_encoder="F16"))
+    assert failed.status == "failed"
+    assert failed.error == "llama.cpp b12359 can't convert Idefics3ForConditionalGeneration's vision encoder."
+    assert hub.gets == ["config.json"]
+
+
+def test_a_vision_encoder_left_to_auto_that_fails_leaves_the_text_model(
+    service: ModelDownloadService, hf: FakeHf, tools: Tools
+) -> None:
+    hf.make_vision()
+    tools.vision_error = ConversionError("llama.cpp's converter failed (exit code 1): KeyError: 'image_mean'")
+    done = wait_for(service, service.start(REPO, quantization="Q4_K_M"))
+    assert done.status == "completed", done.error
+    assert done.notes == [
+        (
+            "Converted as a text model: its vision encoder couldn't be converted. "
+            "llama.cpp's converter failed (exit code 1): KeyError: 'image_mean'"
+        )
+    ]
+    assert done.result is not None and done.result["vision_encoder"] is None
+    assert done.details["vision_encoder"] is None
+    folder = folder_of(service)
+    assert sorted(path.name for path in folder.iterdir()) == ["SmolLM2-135M-Instruct-Q4_K_M.gguf", "localai-model.json"]
+    assert service.library().models[0].vision_encoders == []
+
+
+def test_a_vision_encoder_asked_for_that_fails_fails_the_job_and_trying_again_resumes(
+    service: ModelDownloadService, hub: FakeHub, hf: FakeHf, tools: Tools
+) -> None:
+    hf.make_vision()
+    tools.vision_error = ConversionError("llama.cpp's converter failed (exit code 1): out of memory")
+    failed = wait_for(service, service.start(REPO, quantization="Q4_K_M", vision_encoder="F16"))
+    assert failed.status == "failed"
+    assert failed.error == "llama.cpp's converter failed (exit code 1): out of memory"
+    # The download and the BF16 are kept, and nothing half written.
+    source = folder_of(service) / SOURCE_DIR
+    assert f"{MMPROJ}.partial" not in {path.name for path in source.iterdir()}
+    assert {"model.safetensors", "SmolLM2-135M-Instruct-BF16.gguf"} <= {path.name for path in source.iterdir()}
+
+    tools.vision_error = None
+    hub.gets.clear()
+    done = wait_for(service, service.start(REPO, quantization="Q4_K_M", vision_encoder="F16"))
+    assert done.status == "completed", done.error
+    assert hub.gets == ["config.json"] and len(tools.converted) == 1 and len(tools.converted_vision) == 2
+    assert (folder_of(service) / MMPROJ).is_file() and not source.exists()
+
+
+def test_the_text_model_of_a_vision_model_is_checked_by_the_name_the_converter_goes_by(
+    service: ModelDownloadService, hf: FakeHf, converter: FakeConverter
+) -> None:
+    hf.make_vision()
+    converter.supported = ["LlamaForCausalLM"]
+    with pytest.raises(ModelDownloadRequestError, match="can't convert Idefics3ForConditionalGeneration models"):
+        service.start(REPO)
+    # A few the converter takes by the model's own name.
+    converter.supported = ["Idefics3ForConditionalGeneration"]
+    job = service.start(REPO, quantization="Q4_K_M")
+    assert job.details["conversion"]["architecture"] == "Idefics3ForConditionalGeneration"
+    wait_for(service, job)
+
+
+def test_deleting_a_converted_vision_encoder_leaves_the_model(service: ModelDownloadService, hf: FakeHf) -> None:
+    hf.make_vision()
+    wait_for(service, service.start(REPO, quantization="Q4_K_M"))
+    service.delete(REPO, vision_encoder="F16")
+    [model] = service.library().models
+    assert model.vision_encoders == [] and model.quantizations[0].status == "complete"
+    assert not (folder_of(service) / MMPROJ).exists()
+    with pytest.raises(LocalModelChoiceError, match="has no vision encoder downloaded"):
+        service.local_selection(REPO, vision_encoder="F16")
+
+
+def test_deleting_a_vision_encoder_keeps_an_unfinished_models_download(
+    service: ModelDownloadService, hf: FakeHf, tools: Tools
+) -> None:
+    hf.make_vision()
+    wait_for(service, service.start(REPO, quantization="Q8_0"))
+    tools.quantize_error = ConversionError("llama-quantize failed")
+    wait_for(service, service.start(REPO, quantization="Q4_K_M"))
+    service.delete(REPO, vision_encoder="F16")
+    source = folder_of(service) / SOURCE_DIR
+    assert (source / "SmolLM2-135M-Instruct-BF16.gguf").is_file()
+    service.delete(REPO, quantization="Q4_K_M")
+    assert not source.exists()
+
+
+def test_what_the_converter_goes_by_comes_from_config_json() -> None:
+    assert text_architectures({"architectures": ["LlamaForCausalLM"]}) == ["LlamaForCausalLM"]
+    assert text_architectures(VISION_CONFIG) == ["VLlama3ForCausalLM", "Idefics3ForConditionalGeneration"]
+    # llava_onevision2 only names its text model.
+    assert text_architectures({"text_config": {"architectures": ["Qwen3ForCausalLM"]}}) == ["Qwen3ForCausalLM"]
+    assert text_architectures({}) == []
+    assert vision_architecture(VISION_CONFIG) == "Idefics3ForConditionalGeneration"
+    named = {**VISION_CONFIG, "vision_config": {"architectures": ["RADIOModel"]}}
+    assert vision_architecture(named) == "RADIOModel"
+    assert vision_architecture({"architectures": ["LlamaForCausalLM"]}) is None
+    # An audio model has an encoder too, but not a vision one.
+    assert vision_architecture({"architectures": ["Lfm2AudioForConditionalGeneration"], "audio_config": {}}) is None
+
+
+def test_vision_encoder_options_are_what_the_converter_writes() -> None:
+    assert vision_gguf_name(REPO, "F16") == MMPROJ
+    options = vision_conversion_options(REPO, 400_000_000)
+    assert [(option.id, option.size_bytes) for option in options] == [
+        ("F16", 801_000_000),
+        ("BF16", 801_000_000),
+        ("Q8_0", 426_500_000),
+    ]
+    assert all(option.size_bytes is None for option in vision_conversion_options(REPO, None))
+
+
 # Estimates and the tools' output
 
 
@@ -547,3 +889,16 @@ def test_converting_over_http(client: TestClient) -> None:
     [model] = client.get("/library").json()["models"]
     assert model["quantizations"][0]["converted"] is True
     assert client.post("/downloads", json={"repo_id": REPO, "quantization": "IQ1_S"}).status_code == 422
+    assert client.post("/downloads", json={"repo_id": REPO, "vision_encoder": "F16"}).status_code == 422
+
+
+def test_converting_a_vision_model_over_http(client: TestClient, hf: FakeHf) -> None:
+    hf.make_vision()
+    started = client.post("/downloads", json={"repo_id": REPO, "quantization": "Q8_0"})
+    assert started.status_code == 202
+    assert started.json()["details"]["vision_encoder"] == "F16"
+    with client.stream("GET", f"/downloads/{started.json()['id']}/events") as response:
+        lines = [line for line in response.iter_lines() if line.startswith("data: ")]
+    assert '"status":"completed"' in lines[-1]
+    [model] = client.get("/library").json()["models"]
+    assert model["vision_encoders"][0]["converted"] is True

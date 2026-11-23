@@ -13,6 +13,7 @@ on:
       - services/huggingface.py
       - services/jobs.py
       - services/llama_runtime.py
+      - services/model_conversion.py
       - services/model_downloads.py
       - services/weight_headers.py
       - tests/contract/**
