@@ -1,0 +1,47 @@
+# Checks that GitHub and Hugging Face still answer the way the regular tests'
+# stand-ins pretend they do. Those services change without this code changing,
+# so this runs every week, and on pull requests that touch the code that talks
+# to them or the stand-ins themselves.
+name: Contract
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"  # Mondays, 03:00 UTC, an hour before the weekly end-to-end run
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - services/huggingface.py
+      - services/jobs.py
+      - services/llama_runtime.py
+      - services/model_downloads.py
+      - services/weight_headers.py
+      - tests/contract/**
+      - tests/test_llama_runtime.py
+      - tests/test_model_downloads.py
+      - requirements.txt
+      - .github/workflows/contract.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: Contract
+    # What these services send doesn't depend on the OS asking.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -m contract -v -ra
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
