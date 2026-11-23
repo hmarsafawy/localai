@@ -60,6 +60,8 @@ FILES = {
     "original/consolidated.safetensors": b"other copy",
 }
 WANTED = {name for name in FILES if "/" not in name and not name.endswith((".md", ".py", ".bin"))}
+# config.json is read first as well, to tell what to convert the model as.
+FETCHED = sorted([*WANTED, "config.json"])
 
 
 class FakeHub:
@@ -72,6 +74,8 @@ class FakeHub:
         if request.method == "HEAD":
             return httpx.Response(302)
         self.gets.append(file)
+        if file not in self.files:
+            return httpx.Response(404)
         return httpx.Response(200, content=self.files[file])
 
 
@@ -82,17 +86,27 @@ class FakeHf:
         self.hub = hub
         self.api = self
         self.revision = "abc123"
-        self.architectures: list[str] | None = ["LlamaForCausalLM"]
+        self._architectures: list[str] | None = ["LlamaForCausalLM"]
         self.parameters: int | None = 134_515_008
         self.vision = False
         # Whether the weights' tensor names are ones the requirements know.
         self.recognised = True
 
+    @property
+    def architectures(self) -> list[str] | None:
+        return self._architectures
+
+    @architectures.setter
+    def architectures(self, value: list[str] | None) -> None:
+        """The Hub's summary of config.json, and config.json with it."""
+        self._architectures = value
+        self.hub.files["config.json"] = json.dumps({"architectures": value} if value else {}).encode()
+
     def model_info(self, repo_id: str, files_metadata: bool = False) -> SimpleNamespace:
         return SimpleNamespace(
             id=REPO,
             sha=self.revision,
-            config={"architectures": self.architectures} if self.architectures else {},
+            config={"architectures": self._architectures} if self._architectures else {},
             safetensors=SimpleNamespace(total=self.parameters) if self.parameters else None,
             siblings=[
                 SimpleNamespace(
@@ -141,6 +155,9 @@ class FakeConverter:
 
     def architectures(self, tag: str) -> list[str] | None:
         return self.supported
+
+    def vision_architectures(self, tag: str) -> list[str] | None:
+        return None if self.supported is None else []
 
     def ensure_installed(self, context: JobContext, tag: str) -> dict:
         self.installs.append(tag)
@@ -254,7 +271,7 @@ def test_a_safetensors_repo_is_downloaded_converted_and_quantized(
     assert done.result["converted_with"] == "b12359"
 
     # Only the weights and what the converter reads alongside them.
-    assert sorted(hub.gets) == sorted(WANTED)
+    assert sorted(hub.gets) == FETCHED
     [(source, outfile, outtype)] = tools.converted
     assert source == folder / SOURCE_DIR
     assert outfile == folder / SOURCE_DIR / "SmolLM2-135M-Instruct-BF16.gguf.partial"
@@ -298,7 +315,7 @@ def test_converting_again_is_already_done(service: ModelDownloadService, hub: Fa
     hub.gets.clear()
     again = wait_for(service, service.start(REPO, quantization="Q4_K_M"))
     assert again.result is not None and again.result["already_downloaded"] is True
-    assert hub.gets == [] and len(tools.converted) == 1
+    assert hub.gets == ["config.json"] and len(tools.converted) == 1
 
 
 def test_a_failed_quantize_keeps_the_bf16_and_trying_again_starts_from_it(
@@ -317,7 +334,7 @@ def test_a_failed_quantize_keeps_the_bf16_and_trying_again_starts_from_it(
     hub.gets.clear()
     done = wait_for(service, service.start(REPO, quantization="Q4_K_M"))
     assert done.status == "completed", done.error
-    assert hub.gets == [] and len(tools.converted) == 1 and len(tools.quantized) == 2
+    assert hub.gets == ["config.json"] and len(tools.converted) == 1 and len(tools.quantized) == 2
     assert not source.exists()
 
 
@@ -356,7 +373,7 @@ def test_a_model_the_new_converter_cant_convert_fails_before_downloading(
     done = wait_for(service, service.start(REPO, quantization="Q4_K_M"))
     assert done.status == "failed"
     assert done.error is not None and "can't convert LlamaForCausalLM models" in done.error
-    assert hub.gets == []
+    assert hub.gets == ["config.json"]
 
 
 # Refused up front
@@ -376,7 +393,7 @@ def test_weights_with_unrecognised_tensor_names_are_converted_by_what_config_jso
     hf.recognised = False
     done = wait_for(service, service.start(REPO, quantization="Q4_K_M"))
     assert done.status == "completed", done.error
-    assert sorted(hub.gets) == sorted(WANTED)
+    assert sorted(hub.gets) == FETCHED
 
 
 def test_unrecognised_weights_of_a_model_the_converter_doesnt_know_are_refused_for_that(
@@ -408,14 +425,6 @@ def test_converting_needs_a_runtime(service: ModelDownloadService, converter: Fa
 def test_only_known_quantizations_can_be_chosen(service: ModelDownloadService) -> None:
     with pytest.raises(ModelDownloadRequestError, match="'IQ1_S' isn't available. Available: BF16, F16, Q8_0"):
         service.start(REPO, quantization="IQ1_S")
-
-
-def test_a_vision_encoder_cant_be_converted_yet(service: ModelDownloadService, hf: FakeHf) -> None:
-    with pytest.raises(ModelDownloadRequestError, match="converting one isn't supported yet"):
-        service.start(REPO, vision_encoder="F16")
-    hf.vision = True
-    job = service.start(REPO, quantization="Q4_K_M")
-    assert any("Converted as a text model" in note for note in wait_for(service, job).notes)
 
 
 def test_not_enough_space_for_the_download_and_its_bf16_is_refused(

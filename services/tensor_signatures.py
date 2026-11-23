@@ -85,7 +85,7 @@ MIN_VISION_TENSORS = 8
 VISION_ONLY_SHARE = 0.9
 
 
-def _is_vision_key(key: str) -> bool:
+def is_vision_key(key: str) -> bool:
     return key.startswith(GGUF_VISION_PREFIXES) or any(
         segment in VISION_SEGMENTS for segment in key.split(".")
     )
@@ -94,12 +94,12 @@ def _is_vision_key(key: str) -> bool:
 def has_vision_tensors(tensor_keys: list[str]) -> bool:
     """Whether a file (or component) carries vision encoder weights - e.g. a
     VL model used as a text encoder, or a multimodal LLM checkpoint."""
-    return sum(1 for key in _weight_keys(tensor_keys) if _is_vision_key(key)) >= MIN_VISION_TENSORS
+    return sum(1 for key in _weight_keys(tensor_keys) if is_vision_key(key)) >= MIN_VISION_TENSORS
 
 
 def _is_vision_only(tensor_keys: list[str]) -> bool:
     keys = _weight_keys(tensor_keys)
-    hits = sum(1 for key in keys if _is_vision_key(key))
+    hits = sum(1 for key in keys if is_vision_key(key))
     return hits >= MIN_VISION_TENSORS and hits / len(keys) >= VISION_ONLY_SHARE
 
 

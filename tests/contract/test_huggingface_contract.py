@@ -20,7 +20,8 @@ from huggingface_hub import HfApi, hf_hub_url
 
 from schemas.hf_model import HfModelSearchRequest
 from services.huggingface import HuggingFaceService
-from services.model_downloads import _architecture, _converter_weights, _gguf_files, _parameter_count
+from services.model_conversion import text_architectures
+from services.model_downloads import _converter_weights, _gguf_files, _parameter_count
 from services.weight_headers import read_gguf_metadata
 
 from ..e2e.helpers import GGUF_QUANTIZATION, GGUF_REPO, SAFETENSORS_REPO
@@ -80,10 +81,12 @@ def test_the_app_finds_every_gguf_with_its_size_and_checksum(gguf_info: Any) -> 
         assert SHA256.fullmatch(file.sha256 or ""), f"{file.path} would be downloaded without a check"
 
 
-def test_a_safetensors_repo_says_what_converting_it_needs(api: HfApi) -> None:
+def test_a_safetensors_repo_says_what_converting_it_needs(api: HfApi, http: httpx.Client) -> None:
     info = api.model_info(SAFETENSORS_REPO, files_metadata=True)
     # What picks the converter, and what the size estimate before converting uses.
-    assert _architecture(info) == "LlamaForCausalLM"
+    config = http.get(hf_hub_url(SAFETENSORS_REPO, "config.json", revision=info.sha), follow_redirects=True)
+    assert config.status_code == 200, config.status_code
+    assert text_architectures(config.json()) == ["LlamaForCausalLM"]
     assert (_parameter_count(info) or 0) > 100_000_000
     weights = _converter_weights(info)
     assert weights is not None and weights.files == ["model.safetensors"]

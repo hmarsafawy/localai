@@ -4,6 +4,9 @@ and `llama-quantize` with their progress reported.
 
 The converter writes BF16, F16 or Q8_0 itself. Anything smaller is made from
 its BF16 by `llama-quantize`, which is how llama.cpp's own quantizations are made.
+
+A vision model's vision encoder is converted on its own, into the separate
+`mmproj` GGUF that llama-server takes next to the model.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import math
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 from models.hf_model import HfRoleOption
 from services.jobs import JobContext
@@ -42,6 +46,12 @@ CONVERTER_OUTTYPES = {"BF16": "bf16", "F16": "f16", "Q8_0": "q8_0"}
 INTERMEDIATE = "BF16"
 # The tokenizer, chat template and other metadata, on top of the weights.
 METADATA_BYTES = 20_000_000
+# A vision encoder is only written by the converter: `llama-quantize` doesn't
+# take one. It's small, so F16 is the default, as in llama.cpp's own repos.
+VISION_QUANTIZATIONS = ("F16", "BF16", "Q8_0")
+VISION_DEFAULT = "F16"
+# An mmproj has no tokenizer, only a few settings for preparing images.
+VISION_METADATA_BYTES = 1_000_000
 # A big model takes a while on a slow disk. One that takes longer than this has hung.
 STEP_TIMEOUT_SECONDS = 6 * 60 * 60
 CONVERTER_TAIL_LINES = 5
@@ -83,6 +93,63 @@ def conversion_options(repo_id: str, parameters: int) -> list[HfRoleOption]:
         )
         for quantization in BITS_PER_WEIGHT
     ]
+
+
+def vision_gguf_name(repo_id: str, quantization: str) -> str:
+    """`mmproj-SmolVLM-256M-Instruct-F16.gguf`, as llama.cpp's own repos name them."""
+    return f"mmproj-{gguf_name(repo_id, quantization)}"
+
+
+def vision_conversion_options(repo_id: str, parameters: int | None) -> list[HfRoleOption]:
+    """What a vision encoder can be converted to. Without its parameter count
+    there's no size to give."""
+    return [
+        HfRoleOption(
+            id=quantization,
+            label=quantization,
+            quantization=quantization,
+            format="gguf",
+            files=[vision_gguf_name(repo_id, quantization)],
+            size_bytes=(
+                math.ceil(parameters * BITS_PER_WEIGHT[quantization] / 8) + VISION_METADATA_BYTES
+                if parameters
+                else None
+            ),
+        )
+        for quantization in VISION_QUANTIZATIONS
+    ]
+
+
+def _first_architecture(config: object) -> str | None:
+    architectures = config.get("architectures") if isinstance(config, dict) else None
+    if isinstance(architectures, list) and architectures and isinstance(architectures[0], str):
+        return architectures[0]
+    return None
+
+
+def model_architecture(config: dict[str, Any]) -> str | None:
+    """What the model is, as its `config.json` names it (`LlamaForCausalLM`)."""
+    return _first_architecture(config) or _first_architecture(config.get("text_config"))
+
+
+def text_architectures(config: dict[str, Any]) -> list[str]:
+    """What llama.cpp's converter may convert the text model as, the likelier
+    first. A vision model's text config names its language model, which is what
+    the converter goes by (`VLlama3ForCausalLM` inside SmolVLM's
+    `Idefics3ForConditionalGeneration`), except for a few it converts by the
+    model's own name. Which of the two it is shows in the converter's list."""
+    found = [_first_architecture(config.get("text_config")), _first_architecture(config)]
+    return list(dict.fromkeys(name for name in found if name))
+
+
+def vision_architecture(config: dict[str, Any]) -> str | None:
+    """What llama.cpp's converter converts the vision encoder as: the vision
+    config's own name for it if it has one, else the model's. None for a model
+    whose config declares no vision encoder."""
+    vision_config = config.get("vision_config")
+    if not isinstance(vision_config, dict):
+        return None
+    return _first_architecture(vision_config) or model_architecture(config)
 
 
 def parse_writing(line: str) -> tuple[int, int] | None:
@@ -143,9 +210,15 @@ def _failure(what: str, code: int, output: list[str]) -> ConversionError:
 
 
 def convert(
-    context: JobContext, converter: ConverterCommand, source: Path, outfile: Path, quantization: str
+    context: JobContext,
+    converter: ConverterCommand,
+    source: Path,
+    outfile: Path,
+    quantization: str,
+    vision: bool = False,
 ) -> None:
-    """Converts the model in `source` to `outfile`, as BF16, F16 or Q8_0."""
+    """Converts the model in `source` to `outfile`, as BF16, F16 or Q8_0. With
+    `vision`, it's the model's vision encoder that's converted, to an mmproj."""
     adapt_tokenizer_config(source)
     context.begin_transfer(None)
 
@@ -164,6 +237,7 @@ def convert(
             str(outfile),
             "--outtype",
             CONVERTER_OUTTYPES[quantization],
+            *(["--mmproj"] if vision else []),
         ],
         context,
         timeout=STEP_TIMEOUT_SECONDS,
