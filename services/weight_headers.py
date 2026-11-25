@@ -13,12 +13,24 @@ from __future__ import annotations
 
 import os
 import struct
+from dataclasses import dataclass
 
 from huggingface_hub import HfApi, get_session, hf_hub_url
 from huggingface_hub.utils import build_hf_headers, hf_raise_for_status
 
+
+@dataclass(frozen=True)
+class GgufArray:
+    """An array whose items weren't kept (a tokenizer's strings, or numbers
+    too many to be worth holding), or that the bytes read stop inside. Its
+    length is known either way."""
+
+    item_type: int
+    length: int
+
+
 TensorShapes = dict[str, tuple[int, ...]]
-GgufMetadata = dict[str, str | int | float | bool]
+GgufMetadata = dict[str, str | int | float | bool | tuple[int | float | bool, ...] | GgufArray]
 
 GGUF_MAGIC = b"GGUF"
 GGUF_INITIAL_FETCH_BYTES = 256 * 1024
@@ -28,6 +40,9 @@ GGUF_MAX_FETCH_BYTES = 64 * 1024 * 1024
 # is `general.file_type`, which quantizing writes after the tokenizer: this only
 # reaches it in files with no or a small tokenizer (mmproj, MTP heads).
 GGUF_METADATA_FETCH_BYTES = 64 * 1024
+# Numeric arrays up to this long are kept: per-layer values such as
+# `head_count_kv` or the sliding-window pattern. Longer ones are the tokenizer's.
+GGUF_KEPT_ARRAY_LENGTH = 1024
 
 # GGUF metadata value types -> struct format. 8 (string) and 9 (array) are
 # variable-length and handled separately.
@@ -61,17 +76,23 @@ class _GgufCursor:
     def string(self) -> str:
         return self.take(int(self.unpack("Q"))).decode("utf-8", errors="replace")
 
+    def numbers(self, item_type: int, count: int) -> tuple[int | float | bool, ...]:
+        fmt = f"<{count}{_GGUF_SCALAR_FORMATS[item_type]}"
+        return struct.unpack(fmt, self.take(struct.calcsize(fmt)))
+
+    def skip_items(self, item_type: int, count: int) -> None:
+        if item_type in _GGUF_SCALAR_FORMATS:
+            self.take(count * struct.calcsize("<" + _GGUF_SCALAR_FORMATS[item_type]))
+        else:
+            for _ in range(count):
+                self.skip_value(item_type)
+
     def skip_value(self, value_type: int) -> None:
         if value_type == _GGUF_STRING:
             self.take(int(self.unpack("Q")))
         elif value_type == _GGUF_ARRAY:
             item_type = int(self.unpack("I"))
-            count = int(self.unpack("Q"))
-            if item_type in _GGUF_SCALAR_FORMATS:
-                self.take(count * struct.calcsize("<" + _GGUF_SCALAR_FORMATS[item_type]))
-            else:
-                for _ in range(count):
-                    self.skip_value(item_type)
+            self.skip_items(item_type, int(self.unpack("Q")))
         elif value_type in _GGUF_SCALAR_FORMATS:
             self.take(struct.calcsize("<" + _GGUF_SCALAR_FORMATS[value_type]))
         else:
@@ -91,8 +112,9 @@ def _read_gguf_preamble(cursor: _GgufCursor) -> tuple[int, int]:
 
 
 def parse_gguf_metadata(data: bytes) -> GgufMetadata:
-    """Scalar and string metadata values from the leading bytes of a GGUF
-    file, as far as `data` reaches; arrays (the tokenizer) are skipped."""
+    """Metadata values from the leading bytes of a GGUF file, as far as `data`
+    reaches. Short numeric arrays are kept as tuples; any other array (the
+    tokenizer) is a `GgufArray` giving only its length."""
     cursor = _GgufCursor(data)
     _, kv_count = _read_gguf_preamble(cursor)
     metadata: GgufMetadata = {}
@@ -104,8 +126,18 @@ def parse_gguf_metadata(data: bytes) -> GgufMetadata:
                 metadata[key] = cursor.string()
             elif value_type in _GGUF_SCALAR_FORMATS:
                 metadata[key] = cursor.unpack(_GGUF_SCALAR_FORMATS[value_type])
+            elif value_type == _GGUF_ARRAY:
+                item_type = int(cursor.unpack("I"))
+                length = int(cursor.unpack("Q"))
+                # Set before the items are read, so a prefix that stops inside
+                # the tokenizer still says how many tokens there are.
+                metadata[key] = GgufArray(item_type, length)
+                if item_type in _GGUF_SCALAR_FORMATS and length <= GGUF_KEPT_ARRAY_LENGTH:
+                    metadata[key] = cursor.numbers(item_type, length)
+                else:
+                    cursor.skip_items(item_type, length)
             else:
-                cursor.skip_value(value_type)
+                raise ValueError(f"unknown GGUF metadata value type {value_type}")
     except _NeedMoreBytes:
         pass
     return metadata
