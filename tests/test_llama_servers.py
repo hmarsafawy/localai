@@ -50,6 +50,7 @@ from services.llama_servers import (
     server_arguments,
     whole_model_on_gpu,
 )
+from services.memory_estimate import VISION_OVERHEAD_BYTES
 from services.model_downloads import (
     LocalModelBusyError,
     LocalModelChoiceError,
@@ -890,7 +891,7 @@ def test_the_plan_leaves_room_for_other_programs_and_the_vision_encoder(
     fit_params.answer = "-c 174080 -ngl -1"
     model = library.add(vision=True)
     server = running(service)
-    encoder = len(b"mmproj") + servers_module.VISION_OVERHEAD_BYTES
+    encoder = len(b"mmproj") + VISION_OVERHEAD_BYTES
     target = 1024 + math.ceil((16140 * MIB - 13 * GIB + encoder) / MIB)
     assert server.gpu_plan == GpuPlan(vram_free_bytes=13 * GIB, fit_target_mib=target, whole_model_on_gpu=True)
     assert fit_params.calls == [["--model", str(model), "--device", "ROCm1", "--fit-target", str(target)]]
