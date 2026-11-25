@@ -50,6 +50,7 @@ from services.llama_runtime import (
     same_gpu_name,
     server_binary_name,
 )
+from services.memory_estimate import FIT_MARGIN_MIB, vision_encoder_bytes
 from services.model_downloads import (
     AUTO,
     LANGUAGE_MODEL,
@@ -79,11 +80,6 @@ FAILURE_SEARCH_LINES = 60
 ACTIVE_STATUSES = ("starting", "ready", "stopping")
 FINISHED_STATUSES = ("stopped", "failed")
 
-# llama.cpp's own default for what `--fit` leaves free.
-FIT_MARGIN_MIB = 1024
-# A vision encoder's working buffers, on top of its file. Measured at 1.2 GB in
-# all for a 0.9 GB encoder.
-VISION_OVERHEAD_BYTES = 512 * 1024**2
 # llama-fit-params takes a second or two, and longer when little fits.
 FIT_TIMEOUT_SECONDS = 120
 # Windows' GPU counters lag a little behind what was just allocated.
@@ -510,7 +506,7 @@ class LlamaServerService:
         vision_bytes = 0
         if selection.vision is not None:
             try:
-                vision_bytes = Path(selection.vision.path).stat().st_size + VISION_OVERHEAD_BYTES
+                vision_bytes = vision_encoder_bytes(Path(selection.vision.path).stat().st_size)
             except OSError:
                 pass  # Gone since the check; the launch will say so.
         target = fit_target_mib(reported_free, actual_free, vision_bytes)
