@@ -564,15 +564,6 @@ class HardwareService:
             warnings=warnings,
         )
 
-    def memory_budget(self) -> MemoryBudget | None:
-        """What a model can use right now, or None if that can't be read. A
-        failure here must not fail whoever is only after a hint."""
-        try:
-            return budget_from_hardware(self.get_hardware())
-        except Exception:
-            logger.exception("Could not read the hardware for a memory estimate")
-            return None
-
     def process_gpu_memory(self, pid: int, gpu_name: str) -> tuple[int, int] | None:
         """How much of a process's memory on a GPU is in VRAM and how much
         Windows placed in system RAM, or None where that can't be read. Only
@@ -906,21 +897,22 @@ def _volume_containing(path: Path, volumes: list[StorageVolume]) -> StorageVolum
     return max(containing, key=lambda volume: len(volume.mount), default=None)
 
 
-def budget_from_hardware(hardware: HardwareInfo) -> MemoryBudget:
+def budget_from_hardware(hardware: HardwareInfo, backend: str | None = None) -> MemoryBudget:
     """Sizes a model against the single best GPU. llama.cpp can split across
-    several, but that isn't something to promise from an estimate."""
+    several, but that isn't something to promise from an estimate. `backend` is
+    the llama.cpp build that would run it: a CPU build leaves the GPU unused."""
     ram = hardware.memory.available_bytes
     unified = next((gpu for gpu in hardware.gpus if gpu.kind == "unified"), None)
-    if unified is not None:
-        return MemoryBudget(has_gpu=True, vram_free_bytes=ram, ram_available_bytes=0)
     discrete = [gpu for gpu in hardware.gpus if gpu.kind == "discrete"]
-    if not discrete:
-        return MemoryBudget(has_gpu=False, vram_free_bytes=None, ram_available_bytes=ram)
+    if backend == "cpu" or (unified is None and not discrete):
+        return MemoryBudget(has_gpu=False, vram_free_bytes=None, ram_available_bytes=ram, backend="cpu")
+    if unified is not None:
+        return MemoryBudget(has_gpu=True, vram_free_bytes=ram, ram_available_bytes=0, backend=backend)
     # Unknown usage (no counters) falls back to the card's total.
     best = max(
         (gpu.vram_free_bytes if gpu.vram_free_bytes is not None else gpu.vram_total_bytes) or 0 for gpu in discrete
     )
-    return MemoryBudget(has_gpu=True, vram_free_bytes=best or None, ram_available_bytes=ram)
+    return MemoryBudget(has_gpu=True, vram_free_bytes=best or None, ram_available_bytes=ram, backend=backend)
 
 
 hardware_service = HardwareService()

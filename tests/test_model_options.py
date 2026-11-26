@@ -8,7 +8,7 @@ import pytest
 
 from models.hf_model import HfModelRequirements, HfRequirementRole
 from services.model_options import (
-    FIT_NOTE,
+    FILE_SIZE_FIT_NOTE,
     MemoryBudget,
     annotate_fit,
     attach_options,
@@ -356,7 +356,7 @@ def test_without_hardware_falls_back_to_q4_k_m_and_leaves_fit_null() -> None:
     annotate_fit(requirements, None)
     assert recommended_ids(requirements) == ["Q4_K_M"]
     assert all(option.fit is None for option in requirements.roles[0].options)
-    assert FIT_NOTE not in requirements.notes
+    assert FILE_SIZE_FIT_NOTE not in requirements.notes
 
 
 def test_tagged_variants_arent_recommended_when_a_plain_one_exists() -> None:
@@ -380,7 +380,7 @@ def test_fit_includes_overhead_and_says_its_an_estimate() -> None:
     option = requirements.roles[0].options[0]
     assert option.estimated_memory_bytes == 12 * GB
     assert option.fit == "partial_gpu"
-    assert FIT_NOTE in requirements.notes
+    assert FILE_SIZE_FIT_NOTE in requirements.notes
 
 
 def test_fit_is_only_worked_out_for_language_models() -> None:

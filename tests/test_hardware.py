@@ -308,3 +308,12 @@ def test_usable_partitions_skips_snaps_and_pseudo_filesystems() -> None:
         Partition("tmpfs", "/run", "tmpfs", "rw"),
     ]
     assert [item.mountpoint for item in usable_partitions(partitions)] == ["/"]
+
+
+def test_budget_says_which_backend_it_is_for_and_a_cpu_build_leaves_the_gpu_out() -> None:
+    gpu = GpuInfo(name="gpu", vendor="amd", kind="discrete", vram_total_bytes=16 * GIB, vram_free_bytes=12 * GIB)
+    budget = budget_from_hardware(hardware_with([gpu]), "vulkan")
+    assert (budget.has_gpu, budget.vram_free_bytes, budget.backend) == (True, 12 * GIB, "vulkan")
+    budget = budget_from_hardware(hardware_with([gpu]), "cpu")
+    assert (budget.has_gpu, budget.vram_free_bytes, budget.ram_available_bytes) == (False, None, 32 * GIB)
+    assert budget_from_hardware(hardware_with([])).backend == "cpu"

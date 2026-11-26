@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections import Counter
+import threading
+import time
+from collections import Counter, OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
@@ -20,6 +22,7 @@ from models.hf_model import (
     HfPipelineFile,
     HfPipelineInfo,
     HfRequirementRole,
+    HfRoleOption,
     HfSuggestedSource,
 )
 from schemas.hf_model import HfModelSearchRequest
@@ -29,6 +32,7 @@ from services.model_options import (
     quantization_from_file_type,
     unparsed_gguf_paths,
 )
+from services.model_shape import shape_from_gguf
 from services.pipeline_registry import (
     FamilyDef,
     match_family_by_class,
@@ -46,7 +50,7 @@ from services.tensor_signatures import (
     match_reference,
     shapes_agree,
 )
-from services.weight_headers import TensorShapes, read_gguf_metadata, read_tensor_shapes
+from services.weight_headers import GgufMetadata, TensorShapes, read_gguf_metadata, read_tensor_shapes
 
 MODEL_INDEX_FILENAME = "model_index.json"
 # Modular diffusers pipelines ship this instead. Same component keys, but each
@@ -78,6 +82,11 @@ MAX_GGUF_PROBES = 64
 # Probes are tiny and almost all latency (the Hub redirects to its CDN), so
 # they get more concurrency than full header reads.
 MAX_GGUF_PROBE_WORKERS = 16
+# Probes are kept for a while: grouping a repo's files, naming their
+# quantizations and reading the model's layers all want the same ones, and a
+# download right after its listing wants them all again.
+GGUF_PROBE_CACHE_SECONDS = 600
+GGUF_PROBE_CACHE_ENTRIES = 512
 
 # transformers' naming convention for weightless preprocessing classes
 # (CLIPTokenizer, T5TokenizerFast, AutoProcessor, CLIPImageProcessor, ...).
@@ -129,6 +138,9 @@ class HuggingFaceService:
     def __init__(self, api: HfApi | None = None) -> None:
         self.token = os.getenv("HF_TOKEN")
         self.api = api or HfApi(token=self.token)
+        # (repo, file) -> (when it was read, its metadata).
+        self._probes: OrderedDict[tuple[str, str], tuple[float, GgufMetadata]] = OrderedDict()
+        self._probes_lock = threading.Lock()
 
     def search_models(self, request: HfModelSearchRequest) -> list[HfModel]:
         filters = list(request.tags)
@@ -385,7 +397,28 @@ class HuggingFaceService:
             self._sibling_sizes(info),
             self._quantizations_from_metadata(model_id, unparsed_gguf_paths(requirements)),
         )
+        self._attach_shapes(model_id, requirements)
         return requirements
+
+    def _probe_gguf(self, repo_id: str, filename: str) -> GgufMetadata | None:
+        """A GGUF's leading metadata, from one small range read, or None if it
+        couldn't be read."""
+        key = (repo_id, filename)
+        with self._probes_lock:
+            cached = self._probes.get(key)
+            if cached is not None and time.monotonic() - cached[0] < GGUF_PROBE_CACHE_SECONDS:
+                self._probes.move_to_end(key)
+                return cached[1]
+        try:
+            metadata = read_gguf_metadata(self.token, repo_id, filename)
+        except (HfHubHTTPError, OSError, ValueError):
+            return None
+        with self._probes_lock:
+            self._probes[key] = (time.monotonic(), metadata)
+            self._probes.move_to_end(key)
+            while len(self._probes) > GGUF_PROBE_CACHE_ENTRIES:
+                self._probes.popitem(last=False)
+        return metadata
 
     def _quantizations_from_metadata(self, repo_id: str, filenames: list[str]) -> dict[str, str]:
         """For GGUFs whose names don't say: what each one's own metadata claims,
@@ -394,16 +427,34 @@ class HuggingFaceService:
         slow for a listing, so those stay labelled by their variant text."""
 
         def probe(name: str) -> str | None:
-            try:
-                return quantization_from_file_type(
-                    read_gguf_metadata(self.token, repo_id, name).get("general.file_type")
-                )
-            except (HfHubHTTPError, OSError, ValueError):
-                return None
+            metadata = self._probe_gguf(repo_id, name)
+            return quantization_from_file_type(metadata.get("general.file_type")) if metadata else None
 
         to_probe = filenames[:MAX_GGUF_PROBES]
         probed = self._run_parallel(probe, to_probe, MAX_GGUF_PROBE_WORKERS)
         return {name: quantization for name, quantization in zip(to_probe, probed) if quantization}
+
+    def _attach_shapes(self, repo_id: str, requirements: HfModelRequirements) -> None:
+        """Gives each GGUF language model option its model's layers, from its
+        metadata, for the memory estimate. The model's own keys come before its
+        tokenizer, so a small read reaches them. Every quantization of a model
+        has the same layers, so each variant is read once: an MTP build stores
+        layers the plain one doesn't."""
+        variants: dict[tuple[int, str | None], list[HfRoleOption]] = {}
+        for position, role in enumerate(requirements.roles):
+            if role.present and role.role.startswith("language_model"):
+                for option in role.options:
+                    if option.format == "gguf" and option.files:
+                        variants.setdefault((position, option.variant), []).append(option)
+        groups = list(variants.values())[:MAX_GGUF_PROBES]
+        # A first shard is the one with metadata, and an option's files list its shards in order.
+        probed = self._run_parallel(
+            lambda options: self._probe_gguf(repo_id, options[0].files[0]), groups, MAX_GGUF_PROBE_WORKERS
+        )
+        for options, metadata in zip(groups, probed):
+            shape = shape_from_gguf(metadata) if metadata else None
+            for option in options:
+                option.shape = shape
 
     def _resolve_requirements(
         self,
@@ -1360,19 +1411,13 @@ class HuggingFaceService:
                 variants[name] = []
                 to_probe.append(name)
 
-        def probe(name: str) -> dict[str, Any] | None:
-            try:
-                return read_gguf_metadata(self.token, repo_id, name)
-            except (HfHubHTTPError, OSError, ValueError):
-                return None
-
         to_probe = to_probe[:MAX_GGUF_PROBES]
         representatives: dict[tuple[str, Any], str] = {}
         from_metadata: dict[str, _Identification] = {}
-        probed = self._run_parallel(probe, to_probe, MAX_GGUF_PROBE_WORKERS)
+        probed = self._run_parallel(lambda name: self._probe_gguf(repo_id, name), to_probe, MAX_GGUF_PROBE_WORKERS)
         for name, metadata in zip(to_probe, probed):
             architecture = metadata.get("general.architecture") if metadata else None
-            if not isinstance(architecture, str):
+            if metadata is None or not isinstance(architecture, str):
                 continue
             signature = (architecture, metadata.get(f"{architecture}.embedding_length"))
             if signature in representatives:

@@ -30,6 +30,7 @@ from models.hf_model import HfModelRequirements, HfRequirementRole, HfRoleOption
 from models.jobs import JobInfo
 from schemas.downloads import ModelDownloadRequest
 from services.jobs import DOWNLOAD_CHUNK_BYTES, DownloadIntegrityError, JobContext, JobStore, download_file
+from services.memory_estimate import FIT_MARGIN_MIB, MiB, RuntimeTraits, estimate
 from services.model_downloads import (
     MANIFEST_NAME,
     HubUnavailableError,
@@ -50,7 +51,9 @@ from services.model_options import (
     default_option,
     match_option,
 )
+from services.model_shape import ModelShape
 from services.settings import APP_DIR, models_dir, text_models_dir
+from tests.test_model_fit import LLAMA_31_8B
 
 REPO = "unsloth/Qwen3.8-27B-GGUF"
 Q4 = "Qwen3.8-27B-UD-Q4_K_M.gguf"
@@ -127,6 +130,8 @@ class FakeHf:
         self.roles: list[HfRequirementRole] | None = None
         self.checksums: dict[str, str | None] = {}
         self.info_error: Exception | None = None
+        # The language model's layers, as the real service reads them from its metadata.
+        self.shape: ModelShape | None = None
 
     def model_info(self, repo_id: str, files_metadata: bool = False) -> SimpleNamespace:
         assert files_metadata
@@ -157,6 +162,10 @@ class FakeHf:
                 roles.append(HfRequirementRole(role="vision_encoder", required=False, present=True, files=vision))
         requirements = HfModelRequirements(model_id=repo_id, roles=[role.model_copy(deep=True) for role in roles])
         attach_options(requirements, {name: len(body) for name, body in self.hub.files.items()})
+        for role in requirements.roles:
+            if role.role == "language_model":
+                for option in role.options:
+                    option.shape = self.shape
         return requirements
 
 
@@ -519,6 +528,40 @@ def test_a_choice_that_wont_fit_downloads_with_a_warning(service: ModelDownloadS
     service._budget = lambda: MemoryBudget(has_gpu=False, vram_free_bytes=None, ram_available_bytes=10)
     job = downloaded(service, quantization="Q8_0", vision_encoder="none")
     assert any("not to fit" in note for note in job.notes)
+
+
+def gpu_with_room_for(hub: FakeHub, name: str, context: int, vision: str | None) -> MemoryBudget:
+    """A GPU with exactly enough free for one file at one context. The files here
+    are a few KB, so it's the context and the encoder that decide what fits."""
+    needed = estimate(
+        LLAMA_31_8B, len(hub.files[name]), context, RuntimeTraits("rocm"), len(hub.files[vision]) if vision else 0
+    ).total
+    return MemoryBudget(True, needed + FIT_MARGIN_MIB * MiB, 34 * 10**9, backend="rocm")
+
+
+def test_auto_picks_for_the_context_asked_for(service: ModelDownloadService, hub: FakeHub, hf: FakeHf) -> None:
+    hf.shape = LLAMA_31_8B
+    budget = gpu_with_room_for(hub, Q8, 16384, MMPROJ_F16)
+    service._budget = lambda: budget
+    assert wait_for(service, service.start(REPO)).result["quantization"] == "Q8_0"  # type: ignore[index]
+    # 32K needs 2 GiB more for the KV cache, so nothing fits the GPU whole.
+    assert service.start(REPO, context_size=32768).details["quantization"] == "UD-Q4_K_M"
+
+
+def test_auto_counts_the_vision_encoder_unless_its_left_out(
+    service: ModelDownloadService, hub: FakeHub, hf: FakeHf
+) -> None:
+    hf.shape = LLAMA_31_8B
+    budget = gpu_with_room_for(hub, Q8, 16384, None)
+    service._budget = lambda: budget
+    assert service.start(REPO).details["quantization"] == "UD-Q4_K_M"
+    assert service.start(REPO, vision_encoder="none").details["quantization"] == "Q8_0"
+
+
+def test_the_context_to_pick_for_is_part_of_the_request() -> None:
+    assert ModelDownloadRequest(repo_id=REPO, context_size=32768).context_size == 32768
+    with pytest.raises(ValidationError):
+        ModelDownloadRequest(repo_id=REPO, context_size=100)
 
 
 def test_without_hardware_information_auto_still_picks_q4_k_m(service: ModelDownloadService) -> None:
