@@ -22,6 +22,7 @@ from schemas.hf_model import HfModelSearchRequest
 from services.huggingface import HuggingFaceService
 from services.model_conversion import text_architectures, vision_architecture
 from services.model_downloads import _converter_weights, _gguf_files, _parameter_count
+from services.model_shape import shape_from_gguf
 from services.tensor_signatures import is_vision_key
 from services.weight_headers import read_gguf_metadata
 
@@ -146,6 +147,10 @@ def test_the_app_reads_a_ggufs_header_from_a_slice_of_it() -> None:
     metadata = read_gguf_metadata(None, GGUF_REPO, GGUF_FILE)
     assert metadata["general.architecture"] == "llama"
     assert metadata["llama.context_length"] == 8192
+    # Enough of it for the memory estimate, the vocabulary included.
+    shape = shape_from_gguf(metadata)
+    assert shape is not None
+    assert (shape.n_layer, shape.n_head_kv[0], shape.key_length, shape.vocab_size) == (30, 3, 64, 49152)
 
 
 def test_search_results_have_what_the_app_shows() -> None:

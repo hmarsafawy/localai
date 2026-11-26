@@ -31,11 +31,16 @@ from huggingface_hub.utils import HfHubHTTPError, HFValidationError
 from models.downloads import LocalModel, LocalModelOption, ModelLibrary
 from models.hf_model import HfModelRequirements, HfRequirementRole, HfRoleOption
 from models.jobs import JobInfo
-from services.hardware import hardware_service
 from services.huggingface import HuggingFaceService
 from services.jobs import ACTIVE_STATUSES, JobContext, JobStore, download_file
 from services.llama_converter import ConverterCommand, LlamaConverterService, llama_converter_service
-from services.llama_runtime import LaunchableRuntime, RuntimeConflictError, RuntimeNotFoundError, parse_build_name
+from services.llama_runtime import (
+    LaunchableRuntime,
+    RuntimeConflictError,
+    RuntimeNotFoundError,
+    llama_runtime_service,
+    parse_build_name,
+)
 from services.model_conversion import (
     CONVERTER_OUTTYPES,
     INTERMEDIATE,
@@ -59,6 +64,7 @@ from services.model_options import (
     match_option,
     vision_encoder_options,
 )
+from services.model_shape import shape_from_config
 from services.settings import TEXT_GENERATION_TASK, text_models_dir
 from services.tensor_signatures import is_vision_key
 
@@ -373,7 +379,7 @@ class ModelDownloadService:
         converter: LlamaConverterService | None = None,
     ) -> None:
         self.hf = hf or HuggingFaceService()
-        self._budget = budget or hardware_service.memory_budget
+        self._budget = budget or llama_runtime_service.memory_budget
         self.converter = converter or llama_converter_service
         token = self.hf.token
         # httpx drops this header when a download redirects to another host, so
@@ -397,17 +403,22 @@ class ModelDownloadService:
 
     # Starting a download
 
-    def start(self, repo_id: str, quantization: str = AUTO, vision_encoder: str = AUTO) -> JobInfo:
+    def start(
+        self, repo_id: str, quantization: str = AUTO, vision_encoder: str = AUTO, context_size: int | None = None
+    ) -> JobInfo:
         """Looks everything up first, so a bad repo or choice is an immediate
         error rather than a failed job. Then the work runs in the background.
-        A repo without GGUF files is converted from its safetensors."""
+        A repo without GGUF files is converted from its safetensors. `auto`
+        picks the quantization for `context_size` tokens of context."""
         conversion: _ConversionPlan | None = None
         try:
             info = self.hf.api.model_info(repo_id, files_metadata=True)
             if _gguf_files(info):
-                resolved_id, revision, model, vision = self._resolve(info, repo_id, quantization, vision_encoder)
+                resolved_id, revision, model, vision = self._resolve(
+                    info, repo_id, quantization, vision_encoder, context_size
+                )
             else:
-                conversion = self._plan_conversion(info, repo_id, quantization, vision_encoder)
+                conversion = self._plan_conversion(info, repo_id, quantization, vision_encoder, context_size)
         except HfHubHTTPError:
             raise  # Raised over the network, but the Hub did answer.
         except HFValidationError as error:
@@ -448,7 +459,7 @@ class ModelDownloadService:
         )
 
     def _resolve(
-        self, info: Any, repo_id: str, quantization: str, vision_encoder: str
+        self, info: Any, repo_id: str, quantization: str, vision_encoder: str, context_size: int | None
     ) -> tuple[str, str | None, _Choice, _Choice | None]:
         resolved_id = getattr(info, "id", None) or repo_id
         revision = getattr(info, "sha", None)
@@ -458,7 +469,7 @@ class ModelDownloadService:
         self._check_access(resolved_id, revision, next(iter(files)))
 
         requirements = self.hf.get_model_requirements(resolved_id)
-        annotate_fit(requirements, self._budget())
+        annotate_fit(requirements, self._budget(), context_size, with_vision=vision_encoder.casefold() != NONE)
 
         model_options = language_model_options(requirements)
         if not model_options:
@@ -574,7 +585,9 @@ class ModelDownloadService:
 
     # Starting a conversion
 
-    def _plan_conversion(self, info: Any, repo_id: str, quantization: str, vision_encoder: str) -> _ConversionPlan:
+    def _plan_conversion(
+        self, info: Any, repo_id: str, quantization: str, vision_encoder: str, context_size: int | None
+    ) -> _ConversionPlan:
         resolved_id = getattr(info, "id", None) or repo_id
         revision = getattr(info, "sha", None)
         requirements = self.hf.get_model_requirements(resolved_id)
@@ -610,16 +623,16 @@ class ModelDownloadService:
         parameters = _parameter_count(info) or (weights.size_bytes or 0) // 2
         if vision_parameters and vision_parameters < parameters:
             parameters -= vision_parameters
-        options = conversion_options(resolved_id, parameters)
-        annotate_fit(
-            HfModelRequirements(
-                model_id=resolved_id,
-                roles=[HfRequirementRole(role=LANGUAGE_MODEL, present=True, options=options)],
-            ),
-            self._budget(),
-        )
-        target = self._pick_model(options, quantization)
         vision, vision_note = self._plan_vision(resolved_id, tag, encoder, vision_parameters, vision_encoder)
+        options = conversion_options(resolved_id, parameters)
+        shape = shape_from_config(config)
+        for option in options:
+            option.shape = shape
+        roles = [HfRequirementRole(role=LANGUAGE_MODEL, present=True, options=options)]
+        if vision is not None:
+            roles.append(HfRequirementRole(role=VISION_ENCODER, required=False, present=True, options=[vision]))
+        annotate_fit(HfModelRequirements(model_id=resolved_id, roles=roles), self._budget(), context_size)
+        target = self._pick_model(options, quantization)
 
         notes: list[str] = []
         if supported is None:

@@ -247,7 +247,67 @@ Memory only grows with the context, so it bisects over multiples of 256:
 A model's rating is for one context: **16,384 tokens**, or the context the
 model was trained for if that's shorter. That's enough for a long conversation
 or a few files, and it's the setting where the KV cache is what tells
-same-sized models apart.
+same-sized models apart. `context_size` asks for another one (see below).
+
+## How listings and downloads use it
+
+`GET /models/{id}/requirements` and `POST /downloads` rate every GGUF option of
+a language model with this estimate (`annotate_fit` in
+`services/model_options.py`). Each option gets:
+
+- `memory`: the breakdown above, and the context it's for.
+- `estimated_memory_bytes`: its total.
+- `max_gpu_context`: the longest context that fits, against what's free now.
+- `fit`: one of the four ratings below.
+
+**The model's layers.** All the quantizations of one model have the same
+layers, so the metadata is read once per variant. An MTP build is its own
+variant, because it stores a layer the plain build doesn't. The read is the
+first 64 KB of the first shard. llama.cpp writes the model's own keys before
+the tokenizer, and only the tokenizer's length is needed. The same read
+already groups the repo's files, and it's kept for 10 minutes, so neither the
+listing nor a download right after it makes an extra request. A safetensors
+model that's going to be converted is sized from its `config.json` instead.
+
+**The context.** `context_size` is a query parameter on the listing and a field
+on the download. Without it, the target context above. Either way it's capped
+at what the model was trained for, and `memory.context` says which was used.
+
+**The backend.** The GPU runtime's share depends on the llama.cpp build: the
+active one, or else the one installing would pick for this GPU. A CPU build
+means the model goes in RAM, so it's rated against RAM, with no runtime share.
+
+**The rating.** With `T` the total, `F` the free VRAM of the best GPU and `R`
+the available RAM:
+
+| `fit` | When | Why |
+|---|---|---|
+| `fits_gpu` | `T + 1 GiB ≤ F` | Everything on the GPU, with `--fit`'s margin left free. |
+| `partial_gpu` | `T + 1 GiB ≤ F + R` | `--fit` moves layers to the CPU until the margin is free, so RAM takes the rest. |
+| `cpu_only` | no GPU, `T ≤ R` | |
+| `too_large` | otherwise | |
+
+**The vision encoder.** The encoder that's downloaded with the model by
+default (`vision_encoder=auto`, which picks F16) is counted, because
+llama-server loads it too. With `vision_encoder=none` it's left out.
+
+**What gets recommended** is the same as before: the biggest quantization that
+fits the GPU, ignoring full precision and tagged variants. If none fits, it's
+Q4_K_M, partly on the CPU. What's changed is what "fits" means. On the
+RX 9070 XT with 12,610 MiB free, on ROCm:
+
+| Repo | `size × 1.2` recommended | This recommends, at 16K |
+|---|---|---|
+| unsloth/Qwen3-8B-GGUF | UD-Q8_K_XL, rated 12,387 MiB. At 16K it needs 13,132 plus the margin; the longest context that fits is 5,376. | Q8_0: 11,116 MiB, fits up to 19,456 tokens |
+| unsloth/gemma-3-12b-it-GGUF, with its encoder | UD-Q6_K_XL, rated 12,080 MiB without the encoder. It needs 14,642, and doesn't fit even at 4K. | Q4_K_M: 11,537 MiB, fits up to 16,896 tokens |
+
+At 32K the recommendations drop to Q6_K and UD-Q3_K_XL. `size × 1.2` gives the
+same answer at any context.
+
+**Without the layers.** If the metadata can't be read, the option is rated as
+before, from `size × 1.2`, with no `memory`. That happens with a layout this
+doesn't know, a safetensors repo in a listing, or a failed read. The notes then
+say it's a rough estimate.
 
 ## The measurements
 

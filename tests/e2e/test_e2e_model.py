@@ -41,6 +41,9 @@ def test_requirements_recommend_an_option_that_fits(client: httpx.Client) -> Non
     recommended = [option for option in options if option["recommended"]]
     assert len(recommended) == 1
     assert recommended[0]["fit"] != "too_large"
+    # Sized from the model's own layers: SmolLM2 was trained for 8K, so that's
+    # what it's rated at rather than the 16K default.
+    assert recommended[0]["memory"]["context"] == 8192
 
 
 def test_the_download_is_in_the_library_whole(client: httpx.Client, gguf_model: dict[str, Any]) -> None:

@@ -16,11 +16,14 @@ OPTION_PATTERN = r"^[A-Za-z0-9._-]+$"
 class ModelDownloadRequest(BaseModel):
     """Only the repo is needed. `quantization` and `vision_encoder` take an option
     `id` from `GET /models/{repo}/requirements`, or just a quantization name. By
-    default each is the recommended one; `vision_encoder` can also be `none`."""
+    default each is the recommended one; `vision_encoder` can also be `none`.
+    `context_size` is the context to pick the quantization for: by default
+    16,384 tokens, or what the model was trained for if that's less."""
 
     repo_id: str = Field(pattern=REPO_ID_PATTERN, max_length=200)
     quantization: str = Field(default="auto", pattern=OPTION_PATTERN, max_length=200)
     vision_encoder: str = Field(default="auto", pattern=OPTION_PATTERN, max_length=200)
+    context_size: int | None = Field(default=None, ge=512, le=4_194_304)
 
 
 class ModelLibraryResponse(ModelLibrary):

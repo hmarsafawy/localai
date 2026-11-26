@@ -44,8 +44,9 @@ from models.runtime import (
     RuntimeDevice,
     RuntimeUpdates,
 )
-from services.hardware import HardwareService, hardware_service, rocm_sdk_directories
+from services.hardware import HardwareService, budget_from_hardware, hardware_service, rocm_sdk_directories
 from services.jobs import JobContext, JobStore, download_file
+from services.model_options import MemoryBudget
 from services.settings import github_token, llama_runtimes_dir
 
 logger = logging.getLogger(__name__)
@@ -1095,6 +1096,21 @@ class LlamaRuntimeService:
     def active_id(self) -> str | None:
         """The active build's id, without checking that it's still usable."""
         return self._read_active()
+
+    def memory_budget(self) -> MemoryBudget | None:
+        """What a model can use right now, on the backend it would run on: the
+        active build's, or else the one installing would pick. None if the
+        hardware can't be read: a failure here must not fail whoever is only
+        after a hint."""
+        try:
+            hardware = self.hardware.get_hardware()
+            active = self._read_active()
+            build = parse_build_name(active) if active else None
+            backend = build.backend if build else backend_preferences(hardware)[0].backend
+            return budget_from_hardware(hardware, backend)
+        except Exception:
+            logger.exception("Could not read the hardware for a memory estimate")
+            return None
 
     def _read_active(self) -> str | None:
         try:

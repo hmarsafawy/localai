@@ -12,7 +12,16 @@ import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
-from models.hf_model import HfModelRequirements, HfRequirementRole, HfRoleOption
+from models.hf_model import HfMemoryEstimate, HfModelRequirements, HfRequirementRole, HfRoleOption
+from services.memory_estimate import (
+    FIT_MARGIN_MIB,
+    MiB,
+    RuntimeTraits,
+    estimate,
+    gpu_weight_bytes,
+    max_gpu_context,
+    target_context,
+)
 
 WEIGHT_FORMATS_BY_EXTENSION = {
     ".safetensors": "safetensors",
@@ -27,10 +36,17 @@ WEIGHT_FORMATS_BY_EXTENSION = {
     ".gguf": "gguf",
 }
 
-# llama.cpp reserves room for its context and buffers on top of the weights.
+# For a model whose layers couldn't be read: room for its context and buffers
+# on top of the weights, as a flat share.
 MEMORY_OVERHEAD_FACTOR = 1.2
 
 FIT_NOTE = (
+    "Memory fit is worked out from each model's own layers for the context in its memory.context "
+    "({contexts} tokens), against what's free right now, so other apps change it. A fit on the GPU "
+    "leaves 1 GiB free, as llama.cpp does. A longer context needs more: max_gpu_context is the "
+    "longest that keeps the whole model on the GPU"
+)
+FILE_SIZE_FIT_NOTE = (
     "Memory fit is a rough estimate from file size and what's free right now, not a measurement: "
     "the context size and other apps change what actually fits"
 )
@@ -110,6 +126,9 @@ class MemoryBudget:
     has_gpu: bool
     vram_free_bytes: int | None
     ram_available_bytes: int | None
+    # The llama.cpp backend models will run on (`rocm`, `cuda`, `vulkan`,
+    # `metal`, `cpu`): its runtime takes memory of its own. None if not known.
+    backend: str | None = None
 
 
 @dataclass
@@ -397,18 +416,21 @@ def attach_options(
         role.selection = selection_for(role)
 
 
-def classify_fit(required_bytes: int, budget: MemoryBudget) -> str | None:
-    """None when the numbers needed to answer aren't known."""
+def classify_fit(required_bytes: int, budget: MemoryBudget, gpu_margin_bytes: int = 0) -> str | None:
+    """None when the numbers needed to answer aren't known. `gpu_margin_bytes`
+    is what has to stay free on the GPU, which llama.cpp's `--fit` keeps free
+    even when it moves layers to the CPU."""
     ram = budget.ram_available_bytes
     if budget.has_gpu:
         vram = budget.vram_free_bytes
         if vram is None:
             return None
-        if required_bytes <= vram:
+        needed = required_bytes + gpu_margin_bytes
+        if needed <= vram:
             return "fits_gpu"
         if ram is None:
             return None
-        return "partial_gpu" if required_bytes <= vram + ram else "too_large"
+        return "partial_gpu" if needed <= vram + ram else "too_large"
     if ram is None:
         return None
     return "cpu_only" if required_bytes <= ram else "too_large"
@@ -518,26 +540,90 @@ def default_option(options: list[HfRoleOption]) -> HfRoleOption | None:
     return None
 
 
-def annotate_fit(requirements: HfModelRequirements, budget: MemoryBudget | None) -> None:
+def _rate(
+    option: HfRoleOption,
+    size_bytes: int,
+    budget: MemoryBudget | None,
+    traits: RuntimeTraits,
+    context_size: int | None,
+    vision_file_bytes: int,
+) -> int | None:
+    """Sizes one option and rates it against the budget. Returns the context it
+    was sized for, or None if its model's layers weren't known and it was
+    judged from its file size."""
+    shape = option.shape
+    if shape is None:
+        option.estimated_memory_bytes = math.ceil(size_bytes * MEMORY_OVERHEAD_FACTOR)
+        if budget is not None:
+            option.fit = classify_fit(option.estimated_memory_bytes, budget)
+        return None
+
+    context = target_context(shape, context_size)
+    weights = gpu_weight_bytes(shape, size_bytes)
+    memory = estimate(shape, weights, context, traits, vision_file_bytes)
+    option.estimated_memory_bytes = memory.total
+    option.memory = HfMemoryEstimate(
+        context=context,
+        weights_bytes=memory.weights,
+        kv_cache_bytes=memory.kv_cache,
+        recurrent_state_bytes=memory.recurrent_state,
+        compute_bytes=memory.compute,
+        vision_bytes=memory.vision,
+        runtime_bytes=memory.runtime,
+        total_bytes=memory.total,
+    )
+    if budget is not None:
+        option.fit = classify_fit(memory.total, budget, FIT_MARGIN_MIB * MiB)
+        if budget.has_gpu and budget.vram_free_bytes is not None:
+            option.max_gpu_context = max_gpu_context(
+                shape, weights, budget.vram_free_bytes, traits, vision_file_bytes
+            )
+    return context
+
+
+def annotate_fit(
+    requirements: HfModelRequirements,
+    budget: MemoryBudget | None,
+    context_size: int | None = None,
+    with_vision: bool = True,
+) -> None:
     """Adds the memory estimate and picks a default. Fit is only worked out for
     LLMs for now: a diffusion pipeline's memory is the sum of several roles.
-    With no budget, `fit` stays null and the default falls back to Q4_K_M."""
-    annotated = False
+    With no budget, `fit` stays null and the default falls back to Q4_K_M.
+
+    A model whose layers are known (its options' `shape`) is sized for
+    `context_size` tokens, or TARGET_CONTEXT, but never more than it was
+    trained for. The vision encoder that would be downloaded with it is counted
+    too, unless `with_vision` is off. A model whose layers aren't known is
+    judged from its file size."""
+    vision_file_bytes = 0
     for role in requirements.roles:
-        if _is_language_model(role):
-            for option in role.options:
-                if option.size_bytes is None:
-                    continue
-                option.estimated_memory_bytes = math.ceil(option.size_bytes * MEMORY_OVERHEAD_FACTOR)
-                if budget is not None:
-                    option.fit = classify_fit(option.estimated_memory_bytes, budget)
-                    annotated = annotated or option.fit is not None
-            chosen = _pick_language_model(role.options)
-        elif _is_vision_encoder(role):
-            chosen = _pick_vision_encoder(role.options)
-        else:
+        if _is_vision_encoder(role):
+            encoder = _pick_vision_encoder(role.options)
+            if encoder is not None:
+                encoder.recommended = True
+                if with_vision and not vision_file_bytes:
+                    vision_file_bytes = encoder.size_bytes or 0
+
+    traits = RuntimeTraits((budget.backend if budget else None) or "unknown")
+    contexts: set[int] = set()
+    by_file_size = False
+    for role in requirements.roles:
+        if not _is_language_model(role):
             continue
+        for option in role.options:
+            if option.size_bytes is None:
+                continue
+            context = _rate(option, option.size_bytes, budget, traits, context_size, vision_file_bytes)
+            if option.fit is not None:
+                if context is None:
+                    by_file_size = True
+                else:
+                    contexts.add(context)
+        chosen = _pick_language_model(role.options)
         if chosen is not None:
             chosen.recommended = True
-    if annotated:
-        requirements.notes.append(FIT_NOTE)
+    if contexts:
+        requirements.notes.append(FIT_NOTE.format(contexts=" or ".join(f"{context:,}" for context in sorted(contexts))))
+    if by_file_size:
+        requirements.notes.append(FILE_SIZE_FIT_NOTE)

@@ -25,7 +25,9 @@ _NO_SUCH_JOB = "No such download. Downloads don't survive a restart of the app, 
 async def start_download(request: ModelDownloadRequest) -> JobInfo:
     """Downloads a text model's quantization and vision encoder in the background
     and returns a job to poll. Only `repo_id` is needed: by default it picks the
-    recommended quantization and, if the repo has one, its vision encoder.
+    recommended quantization and, if the repo has one, its vision encoder. The
+    recommendation is the biggest quantization that fits the GPU along with the
+    vision encoder and `context_size` tokens of context (16,384 by default).
 
     `quantization` and `vision_encoder` take an option `id` from
     `GET /models/{repo}/requirements`, or a quantization name such as `Q4_K_M`.
@@ -43,7 +45,9 @@ async def start_download(request: ModelDownloadRequest) -> JobInfo:
     Left to `auto`, one the converter can't convert is left out with a note,
     and the model is converted as a text model."""
     try:
-        return await to_thread.run_sync(service.start, request.repo_id, request.quantization, request.vision_encoder)
+        return await to_thread.run_sync(
+            service.start, request.repo_id, request.quantization, request.vision_encoder, request.context_size
+        )
     except HfHubHTTPError as error:
         raise map_hf_error(error) from error
     except ModelDownloadRequestError as error:

@@ -46,6 +46,7 @@ from services.model_downloads import (
     NotEnoughSpaceError,
 )
 from services.model_options import MemoryBudget
+from tests.test_model_shape import LLAMA_3_8B_CONFIG
 
 REPO = "HuggingFaceTB/SmolLM2-135M-Instruct"
 RUNTIME = "llama-b12359-bin-win-rocm-10.0-x64"
@@ -352,6 +353,18 @@ def test_auto_picks_the_biggest_quantization_that_fits(
     service._budget = lambda: MemoryBudget(has_gpu=True, vram_free_bytes=6 * 10**9, ram_available_bytes=32 * 10**9)
     job = service.start(REPO)
     # Q4_K_M is about 4.9 GB, 5.9 GB with llama.cpp's buffers; Q5_K_S doesn't fit.
+    assert job.details["quantization"] == "Q4_K_M"
+    wait_for(service, job)
+
+
+def test_a_converted_model_is_sized_from_its_config(service: ModelDownloadService, hf: FakeHf, hub: FakeHub) -> None:
+    hf.parameters = 8_030_000_000
+    hub.files["config.json"] = json.dumps(LLAMA_3_8B_CONFIG).encode()
+    service._budget = lambda: MemoryBudget(True, 8 * 10**9, 32 * 10**9, backend="rocm")
+    job = service.start(REPO)
+    # 8 GB is 7,629 MiB. At Llama 3's 8K context, Q4_K_M needs 7,268 MiB with
+    # the margin and Q5_K_S 7,909. The file size plus a fifth would have said
+    # Q6_K (7,570 MiB), which needs 8,866.
     assert job.details["quantization"] == "Q4_K_M"
     wait_for(service, job)
 

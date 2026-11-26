@@ -5,6 +5,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from services.model_shape import ModelShape
+
 
 class HfModelArtifact(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -99,6 +101,26 @@ class HfSuggestedSource(BaseModel):
     note: str | None = None
 
 
+class HfMemoryEstimate(BaseModel):
+    """What running an option takes, term by term, at one context size. How
+    each term is worked out is in docs/memory-estimate.md."""
+
+    # The context, in tokens, this is for.
+    context: int
+    weights_bytes: int
+    # Grows with the context.
+    kv_cache_bytes: int
+    # Fixed, for models with recurrent layers.
+    recurrent_state_bytes: int
+    # Scratch space for a forward pass. Also grows with the context.
+    compute_bytes: int
+    # The vision encoder that's downloaded with the model by default, if any.
+    vision_bytes: int
+    # The GPU runtime's own memory: ROCm's or CUDA's context, kernels, and so on.
+    runtime_bytes: int
+    total_bytes: int
+
+
 class HfRoleOption(BaseModel):
     """One choice for a role: a single quantization, precision or variant of its
     weights, with every file (shards, index, configs) needed to use it."""
@@ -116,8 +138,16 @@ class HfRoleOption(BaseModel):
     shards: int = 1
     size_bytes: int | None = None
     estimated_memory_bytes: int | None = None
+    # How that's made up. None when the model's layers couldn't be read; the
+    # estimate is then the file size plus a fifth.
+    memory: HfMemoryEstimate | None = None
+    # The longest context that keeps all of it on the GPU, the way llama.cpp's
+    # `--fit` would choose one. None if even 4,096 tokens don't fit, or with no GPU.
+    max_gpu_context: int | None = None
     fit: str | None = None  # "fits_gpu" | "partial_gpu" | "cpu_only" | "too_large"
     recommended: bool = False
+    # The model's layers, read from its metadata for the estimate. Internal only.
+    shape: ModelShape | None = Field(default=None, exclude=True)
 
 
 class HfRequirementRole(BaseModel):

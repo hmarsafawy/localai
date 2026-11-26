@@ -1269,3 +1269,30 @@ def test_unknown_install_jobs_are_404_over_http(client: TestClient) -> None:
     assert client.get("/runtimes/llama.cpp/jobs/nope").status_code == 404
     assert client.get("/runtimes/llama.cpp/jobs/nope/events").status_code == 404
     assert client.delete("/runtimes/llama.cpp/jobs/nope").status_code == 404
+
+
+def test_the_memory_budget_is_for_the_backend_that_would_run_the_model(service: LlamaRuntimeService) -> None:
+    # Nothing installed yet: the backend installing would pick.
+    budget = service.memory_budget()
+    assert budget is not None and budget.backend == "rocm"
+
+    service.root.mkdir(parents=True, exist_ok=True)
+    (service.root / "state.json").write_text(json.dumps({"active": "llama-b10878-bin-win-vulkan-x64"}))
+    budget = service.memory_budget()
+    assert budget is not None
+    assert (budget.backend, budget.has_gpu, budget.vram_free_bytes) == ("vulkan", True, 16 * GIB)
+
+    # A CPU build leaves the GPU unused, so the model has to fit in RAM.
+    (service.root / "state.json").write_text(json.dumps({"active": "llama-b10878-bin-win-cpu-x64"}))
+    budget = service.memory_budget()
+    assert budget is not None
+    assert (budget.backend, budget.has_gpu, budget.ram_available_bytes) == ("cpu", False, 32 * GIB)
+
+
+def test_a_memory_budget_that_cant_be_read_is_none(tmp_path: Path) -> None:
+    class BrokenHardware:
+        def get_hardware(self, refresh: bool = False) -> HardwareInfo:
+            raise RuntimeError("WMI isn't answering")
+
+    service = LlamaRuntimeService(hardware=BrokenHardware(), root=tmp_path)  # type: ignore[arg-type]
+    assert service.memory_budget() is None
