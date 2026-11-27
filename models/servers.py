@@ -4,6 +4,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from models.hf_model import HfMemoryEstimate
+
 
 class ServerSettings(BaseModel):
     """What was asked for. Anything left unset is chosen by llama.cpp, which
@@ -27,6 +29,10 @@ class GpuPlan(BaseModel):
     # Whether llama.cpp planned to put the whole model on the GPU. Null when
     # that couldn't be asked, or when `gpu_layers` was set to a number.
     whole_model_on_gpu: bool | None = None
+    # The longest context the memory estimate says keeps the whole model on the
+    # GPU, with what was free. Null if even 4,096 tokens don't, or if the
+    # model's files couldn't be read.
+    max_gpu_context: int | None = None
 
 
 class GpuMemory(BaseModel):
@@ -47,6 +53,10 @@ class LoadedModel(BaseModel):
     slots: int | None = None
     vision: bool = False
     build: str | None = None
+    # What the memory estimate says the whole model takes on the GPU at the
+    # context it loaded, worked out from its files. Set when it runs on a GPU.
+    # Next to `gpu_memory`, it shows how close the estimate came.
+    memory: HfMemoryEstimate | None = None
     # Read from Windows a moment after it's ready. Null elsewhere.
     gpu_memory: GpuMemory | None = None
 

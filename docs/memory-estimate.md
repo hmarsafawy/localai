@@ -49,8 +49,10 @@ stored layers and runs 32, so 1/33 comes off.
 goes on the GPU anyway, but a separate output layer leaves them CPU-only, and
 metadata doesn't say which kind a model is. So the estimate counts them,
 which only ever overstates. The two models measured with a separate output
-layer show how much: 546 MiB for Qwen3.5-9B Q4_K_M and 417 MiB for IQ2_XXS. The
-tensor list in the file settles it, and the launch check (PR 4) will read it.
+layer show how much: 546 MiB for Qwen3.5-9B Q4_K_M and 417 MiB for IQ2_XXS.
+
+**From a downloaded file:** the file's tensor list settles it, to the byte.
+See [At launch](#at-launch).
 
 ## KV cache
 
@@ -126,8 +128,8 @@ The state values follow llama.cpp's `n_embd_r() + n_embd_s()`:
 **Example:** Qwen3.5-9B: 24 layers × 548,864 values × 4 B × 4 slots =
 **201 MiB**, the same at 4K or 256K.
 
-**Measured:** 201.00 MiB on llama-server, and 50.25 MiB on llama-fit-params,
-which runs one slot.
+**Measured:** 201.00 MiB on llama-server. llama-fit-params gave 50.25 MiB,
+because it runs one slot unless told otherwise; the app now tells it 4.
 
 ## Compute buffer
 
@@ -194,6 +196,24 @@ An older Vulkan build, which doesn't do that warmup, took 1,127 MiB. The
 constant was 512 MiB until now, measured on an older build. That's 192 MiB
 short on the current one, so launches with an encoder now leave 256 MiB more
 room.
+
+**At long contexts it needs less.** The same encoder, measured as the
+difference between Qwen3.5-9B IQ2_XXS launched with it and without it:
+
+| Context | The encoder's VRAM |
+|---|---|
+| 16,384 | 1,580 MiB |
+| 65,536 | 1,216 MiB |
+| 205,824 | 1,216 MiB |
+
+Its file and compute buffer are the same at every context. What changes is
+the runtime's share: from 64K up, it keeps 92 MiB after the warm-up instead of
+456. Without the encoder, that share stays between 333 and 346 MiB at every
+context. So the change isn't in the text model. Why the runtime keeps less
+isn't known. The constant keeps the 16K figure, so at long contexts a model
+with an encoder is estimated 364 MiB high. For Qwen3.5 that's about 11,000
+tokens less in `max_gpu_context` than would fit. With one encoder measured,
+it's not worth modeling.
 
 ## GPU runtime
 
@@ -309,6 +329,124 @@ before, from `size × 1.2`, with no `memory`. That happens with a layout this
 doesn't know, a safetensors repo in a listing, or a failed read. The notes then
 say it's a rough estimate.
 
+## At launch
+
+When a model is launched (`POST /servers`), its files are on disk. So the
+estimate no longer has to guess the weights from the file size, and
+llama-server's own allocation can be checked against it.
+
+**The exact weights.** A GGUF's header lists every tensor with the offset
+where its data starts, but not its size. Sorted by offset, each tensor's size
+is the gap to the next one, and for the last, the gap to the end of the file.
+That gap includes the padding to the next 32-byte boundary, under 32 bytes.
+So no table of each quantization type's block size is needed, and new types
+just work. Of those tensors, everything goes on the GPU with every layer
+offloaded except:
+
+- **The input layer:** `token_embd`, plus `position_embd`, `token_types` and
+  `per_layer_token_embd` where a model has them. llama.cpp looks up one row per
+  token in these tables instead of multiplying by them, so it always keeps
+  them in system RAM.
+- **An MTP head:** layers `blk.{n_layer}` and up. llama.cpp doesn't load them.
+
+A model with no `output.weight` uses the token embeddings as its output layer
+too. llama.cpp then puts a copy of them on the GPU, so they're counted once.
+
+Reading the header takes about 0.1 s for a model with a 248K-token tokenizer
+(`read_local_gguf` in `services/weight_headers.py`, `gpu_tensor_bytes` in
+`services/memory_estimate.py`). Checked against llama.cpp's own
+`model buffer size` (MiB):
+
+| Model | From the tensors | llama.cpp put on the GPU | From the file size |
+|---|---|---|---|
+| SmolLM2-135M Q4_K_M (tied output) | 98.87 | 98.93 ROCm, 98.87 Vulkan | 100.57 |
+| LFM3-1.7B Q8_0 (tied output) | 1,752.84 | 1,752.84 | 1,760.71 |
+| Qwen3.5-9B UD-IQ2_XXS | 2,615.55 | 2,615.55 | 3,042.81 |
+| Qwen3.5-9B MTP Q4_K_M | 5,956.55 | 5,956.55 | 6,454.91 |
+
+ROCm pads each tensor a little more than the file does, which accounts for
+SmolLM2's 0.06 MiB.
+
+**Before the model starts,** the app works out `gpu_plan.max_gpu_context`, the
+longest context that keeps the whole model on the GPU, using these weights.
+It measures against the VRAM that's really free: from Windows' counters where
+it can read them, otherwise what the llama.cpp build reports.
+llama-fit-params, llama.cpp's planner, says whether the model will all fit as
+asked. When the two agree it won't, the server's `warnings` say so, along with
+what would help:
+
+> It doesn't all fit on the GPU, so llama.cpp runs part of it on the CPU,
+> which is slower. A context_size of 97,280 or less would keep it all on the
+> GPU.
+
+That one came from launching Qwen3.5-9B MTP Q4_K_M and its encoder at 262,144
+tokens with 12,453 MiB free. When even 4,096 tokens won't fit, the warning says
+the model needs a smaller quantization, or other programs need to free GPU
+memory.
+
+Both have to agree because llama-fit-params plans for more than llama-server
+uses. It reserves logits for 512 tokens, where llama-server reserves them for
+4, one per slot (`n_outputs_max = 4` in its log). That's
+`vocab × 508 × 4 bytes` more: 485 MiB for Qwen3.5's 248K vocabulary. So near
+the edge it says no to a model that llama-server keeps on the GPU. When the
+files can't be read there's no estimate, so its answer stands alone.
+
+**llama-fit-params is told about the four slots.** It takes llama-server's
+arguments but not llama-server's defaults. llama-server runs 4 slots sharing
+one KV cache unless told otherwise; llama-fit-params runs 1. One slot needs a
+quarter of the recurrent state and a quarter of the sliding windows, so it
+planned 151 MiB too little for Qwen3.5-9B at 16K: 562 MiB of context against
+llama-server's 713. The app now passes it `--parallel 4`, and its 713 then
+matches. It refuses `--kv-unified`, so it can't be told the slots share the
+cache. It plans each slot's sliding window separately:
+
+```
+llama-fit-params with --parallel 4:   4 × min(context / 4, window + 512) cells
+llama-server:                         min(context, 4 × window + 512) cells
+```
+
+That's more than llama-server needs, never less. Its answer also decides
+whether the model is read into memory or memory-mapped (see
+`services/llama_servers.py`).
+
+**Once it's loaded,** `loaded.memory` in `GET /servers/{id}` is the estimate
+for the context and slots llama-server reports. The encoder is counted only if
+llama-server loaded one. On Windows, `loaded.gpu_memory` next to it is the VRAM
+measured a moment later, so each launch shows how close the estimate came.
+
+**Measured through the app,** with `POST /servers` as a user would launch it.
+VRAM is from Windows, right after loading and again after a prompt of about
+14,000 tokens wherever the context had room for one. "Over" is the estimate
+less the higher reading. System RAM was 52–356 MiB throughout. Where no
+context was asked for, llama.cpp's `--fit` chose it. ROCm b12359 unless noted,
+on the RX 9070 XT with 12.2–12.4 GiB free. Each cell is in MiB:
+
+| Model | Context | Estimate | VRAM | Over |
+|---|---|---|---|---|
+| SmolLM2-135M Q4_K_M | 4,096 | 591 | 476 | +115 |
+| SmolLM2-135M Q4_K_M | 8,192 (`--fit`) | 685 | 570 | +115 |
+| LFM3-1.7B Q8_0 | 16,384 | 2,426 | 2,311–2,316 | +110 |
+| LFM3-1.7B Q8_0 | 262,144 (`--fit`) | 5,546 | 5,438–5,442 | +104 |
+| Qwen3.5-9B UD-IQ2_XXS | 32,768 | 4,364 | 4,253–4,312 | +52 |
+| Qwen3.5-9B UD-IQ2_XXS + encoder | 16,384 | 5,479 | 5,304–5,362 | +117 |
+| Qwen3.5-9B UD-IQ2_XXS + encoder | 205,824 (`--fit`) | 11,584 | 11,057–11,116 | +468 |
+| Qwen3.5-9B MTP Q4_K_M + encoder | 16,384 | 8,820 | 8,651–8,676 | +144 |
+| Qwen3.5-9B MTP Q4_K_M + encoder | 103,424 (`--fit`) | 11,625 | 11,098–11,123 | +502 |
+| Qwen3.5-9B MTP Q4_K_M, Vulkan b10878 | 32,768 | 7,513 | 7,404 | +109 |
+
+The current stable build, b12774, measured the same to the MiB in three of
+these runs: SmolLM2 at 4K, and both Qwen3.5 builds with the encoder at 16K.
+
+Every estimate is above what was measured. Without an encoder it's over by
+52–115 MiB, which is the runtime constant's headroom. The two runs at around
+500 MiB over are long contexts with an encoder, as described under
+[Vision encoder](#vision-encoder). So no constant has changed. Where `--fit`
+chose the context, it chose a longer one than `max_gpu_context`: 205,824
+against 194,304, and 103,424 against 91,648. `--fit` doesn't count the
+runtime's share, and the estimate overstates the encoder. Both still left
+about 1.1 GiB free, so `max_gpu_context` is on the safe side by about the
+encoder's overstatement.
+
 ## The measurements
 
 These runs were on an RX 9070 XT with 16 GB, using llama.cpp b12359 (ROCm) and
@@ -343,8 +481,10 @@ for models bigger than these.
 
 **Overstates:**
 
-- Token embeddings that stay on the CPU, from file sizes: up to ~0.5 GiB on
-  models with big vocabularies.
+- Token embeddings that stay on the CPU, in listings, which have only the
+  file size: up to ~0.5 GiB on models with big vocabularies. At launch the
+  weights are exact.
+- A vision encoder at a context of 64K or more: by 364 MiB.
 - The GGUF header (the tokenizer) is counted as weights: a few MiB.
 - The MTP share assumes MTP layers are average-sized.
 - The vision encoder constant is for a large encoder (an 876 MiB file); a
@@ -355,8 +495,8 @@ for models bigger than these.
 
 - If llama.cpp turns flash attention off for a model, it needs
   `n_head × context × 2 KiB` more. It does that when a backend lacks the kernel
-  for the model's head size. Not seen on ROCm or Vulkan; the launch check
-  will catch it.
+  for the model's head size. Not seen on ROCm or Vulkan. If it happens,
+  `loaded.gpu_memory` shows more VRAM than `loaded.memory`.
 - The runtime overhead on CUDA and Metal is assumed, not measured.
 - Mixture-of-experts compute follows llama.cpp's graph but hasn't been
   measured on a real MoE model yet.
@@ -377,7 +517,10 @@ differ from what llama-server will allocate:
 - Gemma 3 12B: by the window formula, 960 MiB too low for its sliding
   windows.
 
-The estimate follows llama-server.
+The estimate follows llama-server. Since the launch check, the app passes
+llama-fit-params `--parallel 4`, which fixes the state and makes the windows
+too high instead of too low (see [At launch](#at-launch)). Nothing can be
+passed to fix the logits.
 
 ## Re-measuring
 
@@ -389,5 +532,5 @@ To check a term, or to fill in a backend that isn't measured:
 2. Once the model has loaded, and again after a long prompt, read the
    process's VRAM. On Windows that's `loaded.gpu_memory` in
    `GET /servers/{id}`, read from the `GPU Process Memory` counters right after
-   loading.
+   loading. `loaded.memory` beside it is the estimate for the same context.
 3. VRAM minus the buffers is the runtime's share.

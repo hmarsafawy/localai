@@ -25,7 +25,12 @@ async def launch_server(request: ServerLaunchRequest) -> ModelServer:
     Once it's ready, it's served by this app's OpenAI-compatible API at `/v1`,
     with `model_name` as the `model`. `base_url` is llama.cpp's own chat page,
     which only works on this machine. Launching a model that's already running
-    with the same settings returns that server."""
+    with the same settings returns that server.
+
+    On a GPU, `gpu_plan.max_gpu_context` is the longest context the memory
+    estimate says keeps the whole model there, and `warnings` says so when the
+    model won't all fit. Once it's loaded, `loaded.memory` is the estimate for
+    the context it loaded, next to the VRAM measured in `loaded.gpu_memory`."""
     launch = partial(
         service.launch,
         request.repo_id,

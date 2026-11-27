@@ -14,6 +14,8 @@ Pure functions over a `ModelShape` - nothing here touches the network or the GPU
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from services.model_shape import ModelShape
@@ -41,6 +43,8 @@ DEFAULT_UBATCH = 512
 # took 1,580 MiB on ROCm (llama.cpp b12359): a 248 MiB compute buffer, plus
 # 456 MiB the GPU runtime keeps after llama.cpp warms the encoder up on a
 # worst-case image. On an older Vulkan build, with no such warmup, 1,127 MiB.
+# With a context of 64K or more the runtime kept only 92 MiB after the warmup,
+# and the encoder took 1,216 MiB, so this errs 364 MiB high there.
 VISION_OVERHEAD_BYTES = 768 * MiB
 
 # What the GPU runtime takes in llama-server's process beyond llama.cpp's own
@@ -80,6 +84,13 @@ _FFN_INTERMEDIATES = 3
 _NO_FFN_WIDTH = 4
 # A vocabulary metadata didn't give: the largest in common use (Gemma's).
 UNKNOWN_VOCAB = 262144
+
+# The input layer: tables a token's row is looked up in, rather than
+# multiplied by, so llama.cpp keeps them in system RAM whatever the GPU layers.
+INPUT_TENSORS = frozenset(
+    {"token_embd.weight", "position_embd.weight", "token_types.weight", "per_layer_token_embd.weight"}
+)
+_BLOCK = re.compile(r"blk\.(\d+)\.")
 
 
 @dataclass(frozen=True)
@@ -226,10 +237,31 @@ def gpu_weight_bytes(shape: ModelShape, file_bytes: int) -> int:
     the CPU, but a model whose output layer reuses them gets a copy of them on
     the GPU, and metadata doesn't say which kind a model is. When the output
     layer is separate, this is `vocab x width` at the embeddings' bits too high:
-    546 MiB for Qwen3.5-9B Q4_K_M. The tensor list in the file settles it."""
+    546 MiB for Qwen3.5-9B Q4_K_M. A downloaded file's tensor list settles it:
+    see `gpu_tensor_bytes`."""
     if not shape.nextn_layers:
         return file_bytes
     return file_bytes * shape.n_layer // (shape.n_layer + shape.nextn_layers)
+
+
+def gpu_tensor_bytes(shape: ModelShape, tensor_bytes: Mapping[str, int]) -> int:
+    """The weights llama.cpp puts on the GPU, from the size of each tensor in
+    the file, with every layer offloaded. That's every tensor but:
+
+    - the input layer (`INPUT_TENSORS`), which stays in system RAM;
+    - an MTP head's layers, numbered from `n_layer` up, which aren't loaded.
+
+    A model with no `output.weight` reuses the token embeddings as its output
+    layer, so a copy of them does go on the GPU."""
+    total = 0
+    for name, size in tensor_bytes.items():
+        block = _BLOCK.match(name)
+        if name in INPUT_TENSORS or (block is not None and int(block.group(1)) >= shape.n_layer):
+            continue
+        total += size
+    if "output.weight" not in tensor_bytes:
+        total += tensor_bytes.get("token_embd.weight", 0)
+    return total
 
 
 def estimate(

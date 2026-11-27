@@ -18,6 +18,7 @@ from services.memory_estimate import (
     RuntimeTraits,
     compute_bytes,
     estimate,
+    gpu_tensor_bytes,
     gpu_weight_bytes,
     kv_cache_bytes,
     max_gpu_context,
@@ -209,6 +210,46 @@ def test_mtp_layers_come_off_the_weights() -> None:
     qwen = shape(QWEN35_9B_MTP_GGUF)
     assert gpu_weight_bytes(qwen, 33 * GiB) == 32 * GiB
     assert gpu_weight_bytes(shape(LLAMA_3_8B_GGUF), 5 * GiB) == 5 * GiB
+
+
+def mib(value: float) -> int:
+    return round(value * MiB)
+
+
+def test_the_exact_weights_of_qwen35_mtp_are_what_llama_cpp_put_on_the_gpu() -> None:
+    """The Q4_K_M build's tensors, grouped: llama.cpp's log gave 5,956.55 MiB on
+    ROCm1 and 545.62 MiB on the CPU, and called blk.32 unused. From the file
+    size, it would be 6,454.91 MiB."""
+    tensors = {
+        "token_embd.weight": mib(545.62),
+        "output.weight": mib(758.0),
+        "output_norm.weight": 16384,
+        **{f"blk.{layer}.ffn_down.weight": mib(162.4) for layer in range(32)},
+        "blk.32.attn_q.weight": mib(18.0),
+        "blk.32.nextn.eh_proj.weight": mib(125.99),
+    }
+    expected = mib(758.0) + 16384 + 32 * mib(162.4)
+    assert gpu_tensor_bytes(shape(QWEN35_9B_MTP_GGUF), tensors) == expected
+
+
+def test_an_output_layer_that_reuses_the_embeddings_puts_a_copy_on_the_gpu() -> None:
+    """SmolLM2 has no `output.weight`: llama.cpp's log gave 98.93 MiB on the GPU,
+    every tensor, and the embeddings' 28.69 MiB again on the CPU."""
+    tensors = {"token_embd.weight": mib(28.69), "blk.0.attn_q.weight": mib(70.18), "output_norm.weight": 2304}
+    assert gpu_tensor_bytes(shape(SMOLLM2_135M_GGUF), tensors) == sum(tensors.values())
+
+
+def test_every_lookup_table_stays_on_the_cpu() -> None:
+    tensors = {
+        "token_embd.weight": 1000,
+        "position_embd.weight": 100,
+        "token_types.weight": 10,
+        "per_layer_token_embd.weight": 5000,
+        "output.weight": 1000,
+        "blk.0.attn_q.weight": 300,
+        "rope_freqs.weight": 1,
+    }
+    assert gpu_tensor_bytes(shape(LLAMA_3_8B_GGUF), tensors) == 1301
 
 
 def test_the_target_context_is_capped_at_what_the_model_was_trained_for() -> None:

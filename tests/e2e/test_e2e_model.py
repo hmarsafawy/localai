@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from typing import Any
 
 import httpx
@@ -51,6 +52,30 @@ def test_the_download_is_in_the_library_whole(client: httpx.Client, gguf_model: 
     option = next(item for item in model["quantizations"] if item["quantization"] == GGUF_QUANTIZATION)
     assert option["status"] == "complete"
     assert option["bytes_on_disk"] == option["size_bytes"] > 50 * 1024**2
+
+
+def test_the_memory_estimate_is_close_to_the_vram_it_took(
+    client: httpx.Client, gguf_server: dict[str, Any]
+) -> None:
+    """On a GPU, the estimate for the context it loaded is never under what it
+    took, and over by no more than the slack the runtime is allowed: SmolLM2
+    measured 115 MiB under its estimate on ROCm, 84 on Vulkan. VRAM is only
+    measured on Windows, a couple of seconds after it's ready."""
+    if gguf_server["gpu_plan"] is None:
+        pytest.skip("it runs on the CPU here")
+    memory = gguf_server["loaded"]["memory"]
+    assert memory["context"] == gguf_server["loaded"]["context_size"]
+    if sys.platform != "win32":
+        return
+    deadline = time.monotonic() + 15
+    server = gguf_server
+    while server["loaded"]["gpu_memory"] is None and time.monotonic() < deadline:
+        time.sleep(0.5)
+        server = client.get(f"/servers/{gguf_server['id']}").json()
+    measured = server["loaded"]["gpu_memory"]
+    assert measured is not None, "its VRAM was never read"
+    over = memory["total_bytes"] - measured["vram_bytes"]
+    assert -64 * 1024**2 <= over <= 256 * 1024**2, f"estimated {memory['total_bytes']}, measured {measured}"
 
 
 def test_a_running_model_is_listed_by_v1(client: httpx.Client, gguf_server: dict[str, Any]) -> None:
