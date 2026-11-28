@@ -37,6 +37,7 @@ from typing import Any
 import httpx
 
 from models.hardware import GpuInfo
+from models.hf_model import HfMemoryEstimate
 from models.servers import GpuMemory, GpuPlan, LoadedModel, ModelServer, ServerLogs, ServerSettings
 from services.hardware import HardwareService, hardware_service
 from services.llama_runtime import (
@@ -50,7 +51,16 @@ from services.llama_runtime import (
     same_gpu_name,
     server_binary_name,
 )
-from services.memory_estimate import FIT_MARGIN_MIB, vision_encoder_bytes
+from services.memory_estimate import (
+    DEFAULT_SLOTS,
+    FIT_MARGIN_MIB,
+    MIN_FIT_CONTEXT,
+    RuntimeTraits,
+    estimate,
+    gpu_tensor_bytes,
+    max_gpu_context,
+    vision_encoder_bytes,
+)
 from services.model_downloads import (
     AUTO,
     LANGUAGE_MODEL,
@@ -60,8 +70,11 @@ from services.model_downloads import (
     ModelDownloadService,
     model_download_service,
 )
+from services.model_options import memory_info
+from services.model_shape import ModelShape, shape_from_gguf
 from services.processes import tie_to_app
 from services.settings import llama_server_logs_dir
+from services.weight_headers import read_local_gguf
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +100,7 @@ GPU_MEMORY_DELAY_SECONDS = 2.0
 # More than this in system RAM means VRAM ran out. Buffers the GPU reads from
 # RAM by design come to a few hundred MB.
 SPILL_WARNING_BYTES = 1024**3
+MIB = 1024**2
 
 # llama-server takes settings from the environment too. The app passes everything
 # it wants as arguments, and the server has no use for the app's tokens.
@@ -128,6 +142,16 @@ def _now() -> datetime:
 
 
 @dataclass(frozen=True)
+class ModelMemory:
+    """What the memory estimate needs to know about the files being launched."""
+
+    shape: ModelShape
+    # What llama.cpp will put on the GPU, from the size of each tensor.
+    weights_bytes: int
+    vision_file_bytes: int = 0
+
+
+@dataclass(frozen=True)
 class LaunchPlan:
     """How a launch uses the GPU, worked out just before it starts."""
 
@@ -137,6 +161,8 @@ class LaunchPlan:
     # That GPU as the hardware service names it, to read its memory use by.
     gpu_name: str | None = None
     gpu: GpuPlan | None = None
+    memory: ModelMemory | None = None
+    warnings: tuple[str, ...] = ()
 
 
 def model_name_for(selection: LocalSelection) -> str:
@@ -155,8 +181,18 @@ def fit_target_mib(reported_free: int | None, actual_free: int | None, vision_by
 
 
 def fit_arguments(selection: LocalSelection, settings: ServerSettings, device: str, target_mib: int) -> list[str]:
-    """For llama-fit-params: what llama-server will be given that affects the fit."""
-    arguments = ["--model", selection.model.path, "--device", device, "--fit-target", str(target_mib)]
+    """For llama-fit-params: what llama-server will be given that affects the
+    fit, and the 4 slots llama-server runs without being told to. Left at its
+    own default of one, llama-fit-params plans for a quarter of the recurrent
+    state and sliding windows: 151 MiB short for Qwen3.5-9B. It can't be told
+    the slots share their cache, as llama-server's do, so it plans each slot's
+    sliding window apart: more than llama-server needs, never less."""
+    arguments = [
+        "--model", selection.model.path,
+        "--device", device,
+        "--fit-target", str(target_mib),
+        "--parallel", str(DEFAULT_SLOTS),
+    ]
     if settings.context_size is not None:
         arguments += ["--ctx-size", str(settings.context_size)]
     if settings.gpu_layers == "all":
@@ -180,6 +216,55 @@ def whole_model_on_gpu(fitted: str) -> bool | None:
     if set(answer) - {"-c", "-ngl"}:
         return False
     return layers < 0
+
+
+def read_model_memory(selection: LocalSelection) -> ModelMemory | None:
+    """The model's layers and the exact size of what goes on the GPU, from its
+    files' headers: a tenth of a second for one with a big tokenizer. None if
+    they can't be read, which leaves the launch without an estimate."""
+    model = selection.model
+    first = Path(model.path)
+    # A split model's shards are next to the first, as llama.cpp needs them.
+    paths = [first.with_name(Path(name).name) for name in model.files] if model.files else [first]
+    try:
+        gguf = read_local_gguf(paths)
+        vision_bytes = Path(selection.vision.path).stat().st_size if selection.vision is not None else 0
+        shape = shape_from_gguf(gguf.metadata)
+        if shape is None:
+            logger.info("%s's metadata doesn't give its layers, so it has no memory estimate", model.path)
+            return None
+        return ModelMemory(shape, gpu_tensor_bytes(shape, gguf.tensor_bytes), vision_bytes)
+    except (OSError, ValueError) as error:
+        logger.info("Could not read %s for a memory estimate: %s", model.path, error)
+    except Exception:
+        # Only an estimate: nothing in a file should stop it being launched.
+        logger.exception("Could not read %s for a memory estimate", model.path)
+    return None
+
+
+def fit_warning(settings: ServerSettings, whole: bool | None, longest: int | None, estimated: bool) -> str | None:
+    """What to say when llama.cpp plans to run part of the model on the CPU,
+    with the context that would keep it all on the GPU.
+
+    When there's an estimate, it has to agree. llama-fit-params reserves logits
+    for 512 tokens where llama-server reserves them for 4 (485 MiB more for a
+    248K vocabulary), so near the edge it says a model won't fit whole that
+    llama-server keeps on the GPU. Without `context_size`, llama.cpp shortens
+    the context until it fits, so it doesn't fit whole only if 4,096 tokens
+    don't."""
+    if whole is not False or settings.gpu_layers != "auto":
+        return None
+    warning = "It doesn't all fit on the GPU, so llama.cpp runs part of it on the CPU, which is slower."
+    if not estimated:
+        return warning
+    if longest is None:
+        return (
+            f"{warning} Even a {MIN_FIT_CONTEXT:,}-token context wouldn't keep it all there: that takes a "
+            "smaller quantization, or closing other programs that use the GPU."
+        )
+    if settings.context_size is not None and longest < settings.context_size:
+        return f"{warning} A context_size of {longest:,} or less would keep it all on the GPU."
+    return None
 
 
 def run_fit_params(runtime: LaunchableRuntime, arguments: list[str]) -> str | None:
@@ -344,6 +429,7 @@ class _Server:
     signature: tuple[Any, ...]
     process: subprocess.Popen[bytes]
     gpu_name: str | None = None
+    memory: ModelMemory | None = None
     stop_requested: bool = False
     failure: str | None = None
     done: threading.Event = field(default_factory=threading.Event)
@@ -503,6 +589,7 @@ class LlamaServerService:
         known_free = [gpu.vram_free_bytes for gpu in matches if gpu.vram_free_bytes is not None]
         # Two identical cards can't be told apart, so the fuller one counts.
         actual_free = min(known_free) if known_free else None
+        memory = read_model_memory(selection)
         vision_bytes = 0
         if selection.vision is not None:
             try:
@@ -514,10 +601,29 @@ class LlamaServerService:
         if settings.gpu_layers in ("auto", "all"):
             fitted = self._fit_params(runtime, fit_arguments(selection, settings, device, target))
             whole = whole_model_on_gpu(fitted) if fitted else None
+        free_bytes = actual_free if actual_free is not None else reported_free
+        longest, estimated = None, False
+        if memory is not None and free_bytes is not None:
+            try:
+                longest = max_gpu_context(
+                    memory.shape,
+                    memory.weights_bytes,
+                    free_bytes,
+                    RuntimeTraits(runtime.backend),
+                    memory.vision_file_bytes,
+                )
+                estimated = True
+            except Exception:
+                logger.exception("Could not estimate %s's memory", selection.model.path)
+        warning = fit_warning(settings, whole, longest, estimated)
         return LaunchPlan(
             device=device,
             gpu_name=matches[0].name if matches else None,
-            gpu=GpuPlan(vram_free_bytes=actual_free, fit_target_mib=target, whole_model_on_gpu=whole),
+            gpu=GpuPlan(
+                vram_free_bytes=actual_free, fit_target_mib=target, whole_model_on_gpu=whole, max_gpu_context=longest
+            ),
+            memory=memory,
+            warnings=(warning,) if warning else (),
         )
 
     def _gpus(self) -> list[GpuInfo]:
@@ -588,8 +694,11 @@ class LlamaServerService:
             pid=process.pid,
             log_path=str(log_path),
             created_at=_now(),
+            warnings=list(plan.warnings),
         )
-        server = _Server(info=info, signature=signature, process=process, gpu_name=plan.gpu_name)
+        server = _Server(
+            info=info, signature=signature, process=process, gpu_name=plan.gpu_name, memory=plan.memory
+        )
         self._servers[server_id] = server
         self._prune_finished()
         threading.Thread(target=self._watch, args=(server,), name=f"llama-server-{server_id}", daemon=True).start()
@@ -609,6 +718,8 @@ class LlamaServerService:
                 pass
             if self._is_healthy(server.info.port):
                 loaded = self._loaded_model(server.info.port)
+                if loaded is not None:
+                    loaded.memory = self._estimate(server, loaded)
                 with self._lock:
                     if server.info.status == "starting":
                         server.info.status = "ready"
@@ -648,6 +759,22 @@ class LlamaServerService:
             logger.info("Could not read what llama-server on port %s loaded: %s", port, error)
             return None
 
+    @staticmethod
+    def _estimate(server: _Server, loaded: LoadedModel) -> HfMemoryEstimate | None:
+        """The estimate for what llama-server loaded: the context and slots it
+        reports, the weights in the files, and the encoder if it took one."""
+        memory = server.memory
+        if memory is None or loaded.context_size is None:
+            return None
+        traits = RuntimeTraits(server.info.backend, slots=loaded.slots or DEFAULT_SLOTS)
+        vision = memory.vision_file_bytes if loaded.vision else 0
+        try:
+            return memory_info(estimate(memory.shape, memory.weights_bytes, loaded.context_size, traits, vision))
+        except Exception:
+            # This runs on the thread that watches the server, which mustn't stop.
+            logger.exception("Could not estimate %s's memory", server.info.model_name)
+            return None
+
     def _record_gpu_memory(self, server: _Server) -> None:
         """Where its GPU memory ended up. Windows quietly puts what doesn't fit
         in VRAM in system RAM, where the model runs several times slower once
@@ -668,6 +795,21 @@ class LlamaServerService:
                 return
             loaded = server.info.loaded = server.info.loaded or LoadedModel()
             loaded.gpu_memory = GpuMemory(vram_bytes=vram, system_ram_bytes=system_ram)
+            if loaded.memory is not None:
+                # What the estimate is checked against. VRAM is like for like
+                # only when the whole model is on the GPU. The system RAM is
+                # buffers llama.cpp keeps there by design, unless it's spill.
+                logger.info(
+                    "%s at %s tokens: estimated %d MiB of VRAM, measured %d MiB (%+d MiB), and %d MiB in "
+                    "system RAM. Whole on the GPU: %s",
+                    server.info.model_name,
+                    loaded.memory.context,
+                    loaded.memory.total_bytes // MIB,
+                    vram // MIB,
+                    (loaded.memory.total_bytes - vram) // MIB,
+                    system_ram // MIB,
+                    server.info.gpu_plan.whole_model_on_gpu if server.info.gpu_plan else None,
+                )
             if system_ram > SPILL_WARNING_BYTES:
                 server.info.warnings.append(
                     f"{system_ram / 1e9:.1f} GB of its GPU memory is in system RAM rather than VRAM, so it runs "

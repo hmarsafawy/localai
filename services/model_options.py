@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from models.hf_model import HfMemoryEstimate, HfModelRequirements, HfRequirementRole, HfRoleOption
 from services.memory_estimate import (
     FIT_MARGIN_MIB,
+    MemoryEstimate,
     MiB,
     RuntimeTraits,
     estimate,
@@ -540,6 +541,20 @@ def default_option(options: list[HfRoleOption]) -> HfRoleOption | None:
     return None
 
 
+def memory_info(memory: MemoryEstimate) -> HfMemoryEstimate:
+    """An estimate as the API gives it."""
+    return HfMemoryEstimate(
+        context=memory.context,
+        weights_bytes=memory.weights,
+        kv_cache_bytes=memory.kv_cache,
+        recurrent_state_bytes=memory.recurrent_state,
+        compute_bytes=memory.compute,
+        vision_bytes=memory.vision,
+        runtime_bytes=memory.runtime,
+        total_bytes=memory.total,
+    )
+
+
 def _rate(
     option: HfRoleOption,
     size_bytes: int,
@@ -562,16 +577,7 @@ def _rate(
     weights = gpu_weight_bytes(shape, size_bytes)
     memory = estimate(shape, weights, context, traits, vision_file_bytes)
     option.estimated_memory_bytes = memory.total
-    option.memory = HfMemoryEstimate(
-        context=context,
-        weights_bytes=memory.weights,
-        kv_cache_bytes=memory.kv_cache,
-        recurrent_state_bytes=memory.recurrent_state,
-        compute_bytes=memory.compute,
-        vision_bytes=memory.vision,
-        runtime_bytes=memory.runtime,
-        total_bytes=memory.total,
-    )
+    option.memory = memory_info(memory)
     if budget is not None:
         option.fit = classify_fit(memory.total, budget, FIT_MARGIN_MIB * MiB)
         if budget.has_gpu and budget.vram_free_bytes is not None:

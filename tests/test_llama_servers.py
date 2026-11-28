@@ -31,32 +31,40 @@ import services.processes as processes_module
 from main import app
 from models.downloads import LocalModelOption
 from models.hardware import GpuInfo
+from models.hf_model import HfMemoryEstimate
 from models.runtime import RuntimeDevice
-from models.servers import GpuMemory, GpuPlan, ModelServer, ServerSettings
+from models.servers import GpuMemory, GpuPlan, LoadedModel, ModelServer, ServerSettings
 from services.inference_proxy import InferenceProxy
 from services.llama_runtime import LaunchableRuntime, RuntimeConflictError, RuntimeNotFoundError
 from services.llama_servers import (
     LaunchPlan,
     LlamaServerService,
     ModelLoadingError,
+    ModelMemory,
     ModelNotRunningError,
     ServerConflictError,
     ServerNotFoundError,
     failure_reason,
     fit_arguments,
     fit_target_mib,
+    fit_warning,
     port_is_free,
     read_log_tail,
+    read_model_memory,
     server_arguments,
     whole_model_on_gpu,
 )
-from services.memory_estimate import VISION_OVERHEAD_BYTES
+from services.memory_estimate import VISION_OVERHEAD_BYTES, RuntimeTraits, estimate, max_gpu_context
 from services.model_downloads import (
     LocalModelBusyError,
     LocalModelChoiceError,
     LocalModelNotFoundError,
     LocalSelection,
 )
+from services.model_options import memory_info
+from services.model_shape import ModelShape, shape_from_gguf
+from tests.test_model_shape import LLAMA_3_8B_GGUF
+from tests.test_weight_headers import gguf_file
 
 # The venv's python.exe on Windows is a launcher that runs the real one as a
 # child, so stopping it would leave the fake server running.
@@ -467,8 +475,10 @@ def test_the_planners_answer_says_whether_the_model_fits_whole(fitted: str, whol
 
 
 def test_the_planner_is_given_what_affects_the_fit() -> None:
+    """Including the 4 slots llama-server runs, which llama-fit-params doesn't
+    assume: with one, it plans for a quarter of the recurrent state."""
     assert fit_arguments(SELECTION, ServerSettings(), "ROCm1", 2048) == [
-        "--model", "C:/models/q4.gguf", "--device", "ROCm1", "--fit-target", "2048"
+        "--model", "C:/models/q4.gguf", "--device", "ROCm1", "--fit-target", "2048", "--parallel", "4"
     ]  # fmt: skip
     settings = ServerSettings(context_size=65536, gpu_layers="all")
     assert fit_arguments(SELECTION, settings, "ROCm1", 2048)[-4:] == ["--ctx-size", "65536", "--gpu-layers", "all"]
@@ -894,7 +904,9 @@ def test_the_plan_leaves_room_for_other_programs_and_the_vision_encoder(
     encoder = len(b"mmproj") + VISION_OVERHEAD_BYTES
     target = 1024 + math.ceil((16140 * MIB - 13 * GIB + encoder) / MIB)
     assert server.gpu_plan == GpuPlan(vram_free_bytes=13 * GIB, fit_target_mib=target, whole_model_on_gpu=True)
-    assert fit_params.calls == [["--model", str(model), "--device", "ROCm1", "--fit-target", str(target)]]
+    assert fit_params.calls == [
+        ["--model", str(model), "--device", "ROCm1", "--fit-target", str(target), "--parallel", "4"]
+    ]
     arguments = launch_record(model)["args"]
     assert arguments[arguments.index("--fit-target") + 1] == str(target)
     assert arguments[arguments.index("--load-mode") :][:3] == ["--load-mode", "none", "--no-host"]
@@ -992,6 +1004,227 @@ def test_a_gpu_the_build_cant_see_is_refused(
         service.launch(REPO)
     (model_busy,) = library.checks
     assert service.all_servers() == [] and model_busy(REPO, None) is None
+
+
+# The memory estimate
+
+
+def shape_of(metadata: dict) -> ModelShape:
+    shape = shape_from_gguf(metadata)
+    assert shape is not None
+    return shape
+
+
+def plan_of(server: ModelServer) -> GpuPlan:
+    assert server.gpu_plan is not None
+    return server.gpu_plan
+
+
+def loaded_of(server: ModelServer) -> LoadedModel:
+    assert server.loaded is not None
+    return server.loaded
+
+
+def estimate_of(server: ModelServer) -> HfMemoryEstimate:
+    memory = loaded_of(server).memory
+    assert memory is not None
+    return memory
+
+
+LLAMA_31_8B = shape_of({**LLAMA_3_8B_GGUF, "llama.context_length": 131072})
+LLAMA_WEIGHTS = 4_920_000_000  # Q4_K_M
+ENCODER = 876 * MIB
+
+
+@pytest.fixture
+def llama_files(monkeypatch: pytest.MonkeyPatch) -> ModelMemory:
+    """What the model's files would say. The fake server reads its orders from
+    the model file, so that can't be a real GGUF."""
+    memory = ModelMemory(LLAMA_31_8B, LLAMA_WEIGHTS, ENCODER)
+    monkeypatch.setattr(
+        servers_module,
+        "read_model_memory",
+        lambda selection: memory if selection.vision else ModelMemory(LLAMA_31_8B, LLAMA_WEIGHTS),
+    )
+    return memory
+
+
+def test_a_launch_is_estimated_at_the_context_llama_server_loaded(
+    service: LlamaServerService,
+    library: FakeLibrary,
+    runtimes: FakeRuntimes,
+    hardware: FakeHardware,
+    fit_params: FakeFitParams,
+    llama_files: ModelMemory,
+) -> None:
+    on_a_9070(runtimes, hardware)
+    fit_params.answer = "-c 16384 -ngl -1"
+    library.add(vision=True)
+    server = running(service, context_size=16384)
+    traits = RuntimeTraits("rocm")
+    assert plan_of(server).max_gpu_context == max_gpu_context(LLAMA_31_8B, LLAMA_WEIGHTS, 13 * GIB, traits, ENCODER)
+    assert estimate_of(server) == memory_info(estimate(LLAMA_31_8B, LLAMA_WEIGHTS, 16384, traits, ENCODER))
+    assert estimate_of(server).kv_cache_bytes == 2 * GIB
+    assert server.warnings == []
+
+
+def test_an_encoder_that_wasnt_loaded_isnt_counted(
+    service: LlamaServerService,
+    library: FakeLibrary,
+    runtimes: FakeRuntimes,
+    hardware: FakeHardware,
+    llama_files: ModelMemory,
+) -> None:
+    on_a_9070(runtimes, hardware)
+    library.add(vision=True)
+    server = running(service, vision_encoder="none")
+    assert loaded_of(server).vision is False
+    assert estimate_of(server).vision_bytes == 0
+    assert estimate_of(server).context == 262144  # What the fake says it loaded.
+
+
+def test_a_context_that_wont_fit_whole_is_warned_about_with_one_that_would(
+    service: LlamaServerService,
+    library: FakeLibrary,
+    runtimes: FakeRuntimes,
+    hardware: FakeHardware,
+    fit_params: FakeFitParams,
+    llama_files: ModelMemory,
+) -> None:
+    """13 GiB free leaves room for about 56K tokens of Llama 3.1 8B's 128 KiB each."""
+    on_a_9070(runtimes, hardware)
+    fit_params.answer = "-c 131072 -ngl 21"
+    library.add()
+    server = running(service, context_size=131072, vision_encoder="none")
+    longest = plan_of(server).max_gpu_context
+    assert longest is not None and 50_000 < longest < 60_000
+    assert server.warnings == [
+        (
+            "It doesn't all fit on the GPU, so llama.cpp runs part of it on the CPU, which is slower. "
+            f"A context_size of {longest:,} or less would keep it all on the GPU."
+        )
+    ]
+
+
+def test_a_model_too_big_for_any_context_says_what_would_help(
+    service: LlamaServerService,
+    library: FakeLibrary,
+    runtimes: FakeRuntimes,
+    hardware: FakeHardware,
+    fit_params: FakeFitParams,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    on_a_9070(runtimes, hardware)
+    monkeypatch.setattr(servers_module, "read_model_memory", lambda selection: ModelMemory(LLAMA_31_8B, 16 * GIB))
+    fit_params.answer = "-c 4096 -ngl 25"
+    library.add()
+    server = running(service)
+    assert plan_of(server).max_gpu_context is None
+    assert server.warnings[0].endswith(
+        "Even a 4,096-token context wouldn't keep it all there: that takes a smaller quantization, "
+        "or closing other programs that use the GPU."
+    )
+
+
+def test_a_model_whose_files_cant_be_read_launches_without_an_estimate(
+    service: LlamaServerService,
+    library: FakeLibrary,
+    runtimes: FakeRuntimes,
+    hardware: FakeHardware,
+    fit_params: FakeFitParams,
+) -> None:
+    on_a_9070(runtimes, hardware)
+    fit_params.answer = "-c 65536 -ngl 14"
+    library.add()  # Orders for the fake server, not a GGUF.
+    server = running(service, context_size=65536)
+    assert plan_of(server).max_gpu_context is None
+    assert loaded_of(server).memory is None
+    # llama.cpp's plan still says it won't all fit.
+    assert server.warnings == ["It doesn't all fit on the GPU, so llama.cpp runs part of it on the CPU, which is slower."]
+
+
+def test_an_estimate_that_fails_doesnt_hold_up_the_launch_or_the_server(
+    service: LlamaServerService,
+    library: FakeLibrary,
+    runtimes: FakeRuntimes,
+    hardware: FakeHardware,
+    llama_files: ModelMemory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It's only information: the server still loads and becomes ready."""
+
+    def broken(*arguments: object) -> None:
+        raise RuntimeError("a bug in the estimate")
+
+    monkeypatch.setattr(servers_module, "max_gpu_context", broken)
+    monkeypatch.setattr(servers_module, "estimate", broken)
+    on_a_9070(runtimes, hardware)
+    library.add()
+    server = running(service)
+    assert plan_of(server).max_gpu_context is None
+    assert loaded_of(server).memory is None
+
+
+@pytest.mark.parametrize(
+    ("settings", "whole", "longest", "estimated", "advice"),
+    [
+        (ServerSettings(), True, 8192, True, None),
+        (ServerSettings(), None, None, True, None),
+        (ServerSettings(gpu_layers="all"), False, None, True, None),
+        (ServerSettings(context_size=65536), False, 30720, True, " A context_size of 30,720 or less"),
+        (ServerSettings(), False, None, True, " Even a 4,096-token context"),
+        (ServerSettings(context_size=65536), False, None, True, " Even a 4,096-token context"),
+        # The estimate says it fits where llama.cpp's planner doesn't: that
+        # leaves room for 512 tokens' logits, where llama-server needs 4.
+        (ServerSettings(context_size=16384), False, 30720, True, None),
+        (ServerSettings(), False, 30720, True, None),
+        # Without an estimate, the planner's word goes.
+        (ServerSettings(), False, None, False, ""),
+    ],
+)
+def test_what_the_warning_advises(
+    settings: ServerSettings, whole: bool | None, longest: int | None, estimated: bool, advice: str | None
+) -> None:
+    warning = fit_warning(settings, whole, longest, estimated)
+    if advice is None:
+        assert warning is None
+        return
+    assert warning is not None
+    plain = "It doesn't all fit on the GPU, so llama.cpp runs part of it on the CPU, which is slower."
+    assert warning.startswith(plain + advice) and (advice or warning == plain)
+
+
+def test_the_estimate_reads_a_split_models_layers_and_weights_from_its_files(tmp_path: Path) -> None:
+    """Every shard's tensors, less the embeddings that stay on the CPU."""
+    folder = tmp_path / "Q4_K_M"
+    folder.mkdir()
+    first, second = folder / "model-00001-of-00002.gguf", folder / "model-00002-of-00002.gguf"
+    first.write_bytes(gguf_file(LLAMA_3_8B_GGUF, [("token_embd.weight", 4096), ("blk.0.attn_q.weight", 1024)]))
+    second.write_bytes(gguf_file({"split.count": 2}, [("output.weight", 2048)]))
+    encoder = tmp_path / "mmproj-F16.gguf"
+    encoder.write_bytes(b"\0" * 300)
+    selection = LocalSelection(
+        repo_id=REPO,
+        model=LocalModelOption(
+            id="Q4_K_M",
+            label="Q4_K_M",
+            status="complete",
+            path=str(first),
+            files=["Q4_K_M/model-00001-of-00002.gguf", "Q4_K_M/model-00002-of-00002.gguf"],
+            shards=2,
+        ),
+        vision=LocalModelOption(id="F16", label="F16", status="complete", path=str(encoder)),
+    )
+    assert read_model_memory(selection) == ModelMemory(shape_of(LLAMA_3_8B_GGUF), 1024 + 2048, 300)
+
+
+def test_the_estimate_needs_the_models_layers(tmp_path: Path) -> None:
+    path = tmp_path / "model.gguf"
+    path.write_bytes(gguf_file({"general.architecture": "llama"}, [("token_embd.weight", 4096)]))
+    selection = LocalSelection(
+        repo_id=REPO, model=LocalModelOption(id="Q4_K_M", label="Q4_K_M", path=str(path)), vision=None
+    )
+    assert read_model_memory(selection) is None
 
 
 def wait_for_gpu_memory(service: LlamaServerService, server: ModelServer, timeout: float = 10) -> ModelServer:
